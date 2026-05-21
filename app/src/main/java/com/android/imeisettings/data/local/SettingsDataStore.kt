@@ -50,6 +50,9 @@ class SettingsDataStore private constructor(private val context: Context) {
         val LEARNING_MODE_ACTIVE = booleanPreferencesKey("learning_mode_active")
         val LEARNING_MODE_END_TIME = longPreferencesKey("learning_mode_end_time")
         val WEAR_BLE_ALERT_ENABLED = booleanPreferencesKey("wear_ble_alert_enabled")
+        val SELECTED_TAC = stringPreferencesKey("selected_tac")
+        val ROTATION_USE_SAME_TAC = booleanPreferencesKey("rotation_use_same_tac")
+        val OPENCELLID_API_KEY = stringPreferencesKey("opencellid_api_key")
     }  // end companion object
 
     val preventRepeats: Flow<Boolean> = context.dataStore.data.map { it[PREVENT_REPEATS] ?: false }
@@ -70,6 +73,9 @@ class SettingsDataStore private constructor(private val context: Context) {
     val learningModeActive: Flow<Boolean> = context.dataStore.data.map { it[LEARNING_MODE_ACTIVE] ?: false }
     val learningModeEndTime: Flow<Long> = context.dataStore.data.map { it[LEARNING_MODE_END_TIME] ?: 0L }
     val wearBleAlertEnabled: Flow<Boolean> = context.dataStore.data.map { it[WEAR_BLE_ALERT_ENABLED] ?: false }
+    val selectedTac: Flow<String> = context.dataStore.data.map { it[SELECTED_TAC] ?: "" }
+    val rotationUseSameTac: Flow<Boolean> = context.dataStore.data.map { it[ROTATION_USE_SAME_TAC] ?: true }
+    val openCelliDApiKey: Flow<String> = context.dataStore.data.map { it[OPENCELLID_API_KEY] ?: "" }
 
     suspend fun setAutoCleanLogs(enabled: Boolean) {
         Log.d("CONSUL_SETTINGS", "setAutoCleanLogs: $enabled")

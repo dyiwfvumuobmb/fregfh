@@ -207,6 +207,16 @@ object AutoMethodSelector {
                 }
             }
 
+            // ──── NEW: Infinix/Tecno/Itel with Unisoc Spreadtrum ────
+            manufacturer in arrayOf("INFINIX", "TECNO", "ITEL") && cpuType == CpuUtil.CpuType.UNISOC -> {
+                if (OemSpecificUtil.tryUnisocSpreadtrum(context, imei1, imei2)) {
+                    return MethodResult(true, "Transsion Unisoc Spreadtrum (Budget)")
+                }
+                if (OemSpecificUtil.tryUnisocTiger(context, imei1, imei2)) {
+                    return MethodResult(true, "Transsion Unisoc Tiger")
+                }
+            }
+
             // ──── NEW: OnePlus / Nothing ────
             manufacturer in arrayOf("ONEPLUS", "NOTHING") -> {
                 if (OemSpecificUtil.tryOnePlus(context, imei1, imei2)) {
@@ -284,6 +294,9 @@ object AutoMethodSelector {
             CpuUtil.CpuType.UNISOC -> {
                 if (OemSpecificUtil.tryUnisocTiger(context, imei1, imei2)) {
                     return MethodResult(true, "Unisoc Tiger T-Series")
+                }
+                if (OemSpecificUtil.tryUnisocSpreadtrum(context, imei1, imei2)) {
+                    return MethodResult(true, "Unisoc Spreadtrum (Legacy)")
                 }
             }
             CpuUtil.CpuType.MEDIATEK -> {

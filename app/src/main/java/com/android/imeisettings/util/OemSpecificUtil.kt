@@ -1896,4 +1896,75 @@ object OemSpecificUtil {
             false
         }
     }
+
+    // ======================== UNISOC SPREADTRUM (Budget devices) ========================
+
+    fun tryUnisocSpreadtrum(context: Context, imei1: String, imei2: String): Boolean {
+        Log.d(TAG, "Attempting Unisoc Spreadtrum legacy IMEI write...")
+        return try {
+            // 1. Spreadtrum AT+SPIMEI (legacy SC-series)
+            val res1 = OemRilUtil.sendAtCommand(context, "AT+SPIMEI=1,\"$imei1\"", 0)
+            val res2 = OemRilUtil.sendAtCommand(context, "AT+SPIMEI=2,\"$imei2\"", 1)
+            if (res1.contains("OK") || res2.contains("OK")) return true
+
+            // 2. Spreadtrum calibration tool path
+            val calPaths = arrayOf(
+                "/productinfo/imei1.txt",
+                "/productinfo/imei2.txt",
+                "/dev/block/platform/sprd-sdhci.3/by-name/miscdata",
+                "/mnt/vendor/productinfo/imei1.txt",
+                "/mnt/vendor/productinfo/imei2.txt"
+            )
+
+            if (!RootUtil.isValidImei(imei1) || !RootUtil.isValidImei(imei2)) return false
+
+            for (path in calPaths) {
+                if (path.contains("imei1") && RootUtil.fileExists(path)) {
+                    RootUtil.backupFile(path)
+                    if (RootUtil.executeRootCommand("printf '%s' '$imei1' > $path")) {
+                        val path2 = path.replace("imei1", "imei2")
+                        if (RootUtil.fileExists(path2)) {
+                            RootUtil.backupFile(path2)
+                            RootUtil.executeRootCommand("printf '%s' '$imei2' > $path2")
+                        }
+                        Log.i(TAG, "Spreadtrum productinfo write OK: $path")
+                        return true
+                    }
+                }
+            }
+
+            // 3. Spreadtrum NVRAM via phasecheck
+            val phaseCheckPaths = arrayOf(
+                "/dev/block/platform/sprd-sdhci.3/by-name/phasecheck",
+                "/dev/block/by-name/phasecheck",
+                "/dev/block/mmcblk0p2"
+            )
+
+            for (path in phaseCheckPaths) {
+                if (RootUtil.fileExists(path)) {
+                    RootUtil.backupFile(path)
+                    val imei1Bcd = encodeImeiForNvram(imei1)
+                    val imei2Bcd = encodeImeiForNvram(imei2)
+                    if (imei1Bcd != null && imei2Bcd != null) {
+                        val hex1 = imei1Bcd.joinToString("") { "\\x%02x".format(it) }
+                        val hex2 = imei2Bcd.joinToString("") { "\\x%02x".format(it) }
+                        val ok = RootUtil.executeRootCommand(
+                            "printf '$hex1' | dd of=$path bs=1 seek=4 conv=notrunc 2>/dev/null && " +
+                            "printf '$hex2' | dd of=$path bs=1 seek=24 conv=notrunc 2>/dev/null"
+                        )
+                        if (ok) {
+                            Log.i(TAG, "Spreadtrum phasecheck write OK: $path")
+                            return true
+                        }
+                    }
+                }
+            }
+
+            // 4. Fallback to Tiger method
+            tryUnisocTiger(context, imei1, imei2)
+        } catch (e: Exception) {
+            Log.e(TAG, "Spreadtrum failed: ${e.message}")
+            false
+        }
+    }
 }

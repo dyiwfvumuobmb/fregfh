@@ -632,6 +632,67 @@ object PduAnalyzer {
             }
         }
 
+        // 36. WAP Push binary SMS detection (OTA provisioning attack)
+        if (rawFields != null && hasUdhi && udhPorts != null) {
+            val dstPort = udhPorts.destPort
+            if (dstPort == 2948 || dstPort == 2949) {
+                if (dstPort == 2948) {
+                    attacks.add("SIMJACKER_PORT_DETECTED")
+                    threatLevel = maxOf(threatLevel, ThreatLevel.CRITICAL)
+                    description.append("SIMjacker attack port 2948 detected — STK command injection. ")
+                } else {
+                    attacks.add("WIBATTACK_PORT_DETECTED")
+                    threatLevel = maxOf(threatLevel, ThreatLevel.CRITICAL)
+                    description.append("WIBattack port 2949 detected — WIB exploitation attempt. ")
+                }
+            }
+            if (dstPort == 2948 || dstPort == 2949 || dstPort == 9200 || dstPort == 9201 || dstPort == 9202 || dstPort == 9203) {
+                val wapResult = decodeWapPushPayload(rawFields.userData, hasUdhi)
+                if (wapResult != null) {
+                    attacks.add("WAP_PUSH_OTA_ATTACK")
+                    threatLevel = maxOf(threatLevel, ThreatLevel.HIGH)
+                    description.append("WAP Push OTA: $wapResult. ")
+                }
+            }
+        }
+
+        // 37. SIM Toolkit (STK) remote command detection
+        if (rawFields != null && rawFields.userData.isNotEmpty()) {
+            val stkResult = detectStkCommands(rawFields.userData, hasUdhi)
+            if (stkResult != null) {
+                attacks.add("STK_REMOTE_COMMAND")
+                threatLevel = maxOf(threatLevel, ThreatLevel.CRITICAL)
+                description.append("STK remote command: $stkResult. ")
+            }
+        }
+
+        // 38. SIMjacker S@T Browser exploit detection
+        if (rawFields != null && rawFields.userData.size >= 6) {
+            val simjackerResult = detectSimjackerExploit(rawFields.userData, hasUdhi)
+            if (simjackerResult != null) {
+                attacks.add("SIMJACKER_SAT_EXPLOIT")
+                threatLevel = maxOf(threatLevel, ThreatLevel.CRITICAL)
+                description.append("SIMjacker S@T exploit: $simjackerResult. ")
+            }
+        }
+
+        // 39. WIBattack detection (Wireless Internet Browser exploitation)
+        if (rawFields != null && rawFields.userData.size >= 4) {
+            val wibResult = detectWibAttack(rawFields.userData, hasUdhi)
+            if (wibResult != null) {
+                attacks.add("WIBATTACK_EXPLOIT")
+                threatLevel = maxOf(threatLevel, ThreatLevel.CRITICAL)
+                description.append("WIBattack exploit: $wibResult. ")
+            }
+        }
+
+        // 40. OTA SIM configuration attack detection
+        if (rawFields != null && pid == 0x7F) {
+            attacks.add("OTA_SIM_CONFIG")
+            threatLevel = maxOf(threatLevel, ThreatLevel.HIGH)
+            description.append("OTA SIM configuration message (PID=0x7F) — possible remote SIM update. ")
+        }
+
         val isThreat = attacks.isNotEmpty()
         val honeypotTriggered = isThreat
 
@@ -1496,5 +1557,213 @@ object PduAnalyzer {
     private fun decodeBcdByte(b: Byte): Int {
         val v = b.toInt() and 0xFF
         return (v and 0x0F) * 10 + ((v shr 4) and 0x0F)
+    }
+
+    // ==================== WAP PUSH / OTA DECODER ====================
+
+    private fun decodeWapPushPayload(userData: ByteArray, hasUdhi: Boolean): String? {
+        try {
+            val dataStart = if (hasUdhi) ((userData[0].toInt() and 0xFF) + 1).coerceAtMost(userData.size) else 0
+            if (dataStart >= userData.size - 2) return null
+            val payload = userData.copyOfRange(dataStart, userData.size)
+
+            // WAP Push Content-Type identifiers
+            val contentType = payload.getOrNull(1)?.toInt()?.and(0xFF) ?: return null
+
+            val typeStr = when (contentType) {
+                0x06 -> "text/plain"
+                0x30 -> "application/vnd.wap.sic" // SI Push
+                0x31 -> "application/vnd.wap.slc" // SL Push (Service Loading)
+                0x32 -> "application/vnd.wap.coc" // CO Push
+                0x3E -> "application/vnd.wap.connectivity-wbxml" // OTA provisioning
+                0x44 -> "application/vnd.oma.drm.rights+xml"
+                0x46 -> "application/vnd.oma.drm.rights+wbxml"
+                0xB0 -> "application/vnd.wap.locc+wbxml" // Location Push
+                0xB4 -> "application/vnd.syncml.dm+wbxml" // OMA DM
+                else -> "unknown/0x${"%02x".format(contentType)}"
+            }
+
+            // OTA provisioning (0x3E) is highly suspicious
+            if (contentType == 0x3E || contentType == 0xB4) {
+                return "OTA provisioning ($typeStr) — remote device configuration attempt"
+            }
+
+            // Service Loading (SL) can auto-load URLs
+            if (contentType == 0x31) {
+                return "Service Loading ($typeStr) — auto-loading URL push"
+            }
+
+            return "WAP Push type: $typeStr"
+        } catch (e: Exception) {
+            return null
+        }
+    }
+
+    // ==================== STK COMMAND DETECTION ====================
+
+    private fun detectStkCommands(userData: ByteArray, hasUdhi: Boolean): String? {
+        val dataStart = if (hasUdhi) ((userData[0].toInt() and 0xFF) + 1).coerceAtMost(userData.size) else 0
+        if (dataStart >= userData.size - 3) return null
+        val payload = userData.copyOfRange(dataStart, userData.size)
+
+        // Look for STK proactive command tags
+        for (i in 0 until payload.size - 1) {
+            val b = payload[i].toInt() and 0xFF
+            if (b == 0xD0 || b == 0xD1) { // BER-TLV proactive command / SMS-PP download
+                val cmdByte = payload.getOrNull(i + 3)?.toInt()?.and(0xFF) ?: continue
+                val cmdName = when (cmdByte) {
+                    STK_SETUP_CALL -> "SETUP_CALL (dial number)"
+                    STK_SEND_SS -> "SEND_SS (supplementary service)"
+                    STK_SEND_USSD -> "SEND_USSD"
+                    STK_SEND_SMS -> "SEND_SMS (exfiltrate data)"
+                    STK_SEND_DTMF -> "SEND_DTMF"
+                    STK_LAUNCH_BROWSER -> "LAUNCH_BROWSER (phishing URL)"
+                    STK_PROVIDE_LOCAL_INFO -> "PROVIDE_LOCAL_INFO (location leak)"
+                    STK_OPEN_CHANNEL -> "OPEN_CHANNEL (data exfil channel)"
+                    STK_CLOSE_CHANNEL -> "CLOSE_CHANNEL"
+                    STK_SEND_DATA -> "SEND_DATA (exfiltrate)"
+                    STK_RUN_AT_CMD -> "RUN_AT_COMMAND (modem control)"
+                    STK_POWER_OFF_CARD -> "POWER_OFF_CARD (DoS)"
+                    STK_POWER_ON_CARD -> "POWER_ON_CARD"
+                    STK_RECEIVE_DATA -> "RECEIVE_DATA"
+                    STK_DISPLAY_TEXT -> "DISPLAY_TEXT (social engineering)"
+                    else -> null
+                }
+                if (cmdName != null) return cmdName
+            }
+        }
+        return null
+    }
+
+    // ==================== SIMJACKER EXPLOIT DETECTION ====================
+
+    private fun detectSimjackerExploit(userData: ByteArray, hasUdhi: Boolean): String? {
+        val dataStart = if (hasUdhi) ((userData[0].toInt() and 0xFF) + 1).coerceAtMost(userData.size) else 0
+        if (dataStart >= userData.size - 4) return null
+        val payload = userData.copyOfRange(dataStart, userData.size)
+
+        // S@T Browser command header: 0xA0 0xA4 (SELECT) or 0xA0 0xC0 (GET RESPONSE)
+        for (i in 0 until payload.size - 3) {
+            val b0 = payload[i].toInt() and 0xFF
+            val b1 = payload.getOrNull(i + 1)?.toInt()?.and(0xFF) ?: continue
+
+            // S@T Browser APDU commands
+            if (b0 == 0xA0) {
+                when (b1) {
+                    0xA4 -> return "S@T SELECT command — file system traversal"
+                    0xC0 -> return "S@T GET RESPONSE — data exfiltration"
+                    0xB0 -> return "S@T READ BINARY — reading SIM data"
+                    0xB2 -> return "S@T READ RECORD — reading SIM records"
+                    0xF2 -> return "S@T STATUS — querying SIM status"
+                    0x12 -> return "S@T FETCH — retrieving proactive command"
+                }
+            }
+
+            // Envelope command for STK
+            if (b0 == 0x80 && b1 == 0xC2) {
+                return "STK ENVELOPE command — remote command injection"
+            }
+        }
+
+        // Check for BER-TLV S@T Browser header
+        if (payload.size >= 3 && (payload[0].toInt() and 0xFF) == 0xD0) {
+            val innerTag = payload.getOrNull(2)?.toInt()?.and(0xFF) ?: return null
+            if (innerTag == 0x81) {
+                return "S@T BER-TLV proactive command header detected"
+            }
+        }
+
+        return null
+    }
+
+    // ==================== WIBATTACK DETECTION ====================
+
+    private fun detectWibAttack(userData: ByteArray, hasUdhi: Boolean): String? {
+        val dataStart = if (hasUdhi) ((userData[0].toInt() and 0xFF) + 1).coerceAtMost(userData.size) else 0
+        if (dataStart >= userData.size - 2) return null
+        val payload = userData.copyOfRange(dataStart, userData.size)
+
+        // WIB (Wireless Internet Browser) commands
+        for (i in 0 until payload.size - 2) {
+            val b = payload[i].toInt() and 0xFF
+            // WIB uses WML (Wireless Markup Language) bytecodes
+            if (b == 0x01) { // WBXML version indicator
+                val pubId = payload.getOrNull(i + 1)?.toInt()?.and(0xFF) ?: continue
+                if (pubId == 0x0D || pubId == 0x04) { // WML 1.1 / WML 1.3
+                    // Check for navigate/go tags that could redirect to malicious URLs
+                    for (j in i until (payload.size - 1).coerceAtMost(i + 50)) {
+                        val tag = payload[j].toInt() and 0xFF
+                        if (tag == 0x83) return "WIB navigate/go command — URL redirection"
+                        if (tag == 0x8E) return "WIB postfield — data exfiltration form"
+                    }
+                    return "WIB WML binary payload detected"
+                }
+            }
+        }
+        return null
+    }
+
+    // ==================== PCAP EXPORT ====================
+
+    fun exportPduToPcap(pduList: List<ByteArray>, outputPath: String): Boolean {
+        return try {
+            java.io.FileOutputStream(outputPath).use { fos ->
+                // PCAP Global Header (24 bytes)
+                val globalHeader = byteArrayOf(
+                    0xD4.toByte(), 0xC3.toByte(), 0xB2.toByte(), 0xA1.toByte(), // Magic number (little-endian)
+                    0x02, 0x00, // Major version
+                    0x04, 0x00, // Minor version
+                    0x00, 0x00, 0x00, 0x00, // Timezone offset
+                    0x00, 0x00, 0x00, 0x00, // Timestamp accuracy
+                    0x00, 0x00, 0x04, 0x00, // Snap length (65536)
+                    0x93.toByte(), 0x00, 0x00, 0x00 // Link-layer type: GSMTAP (147)
+                )
+                fos.write(globalHeader)
+
+                for (pdu in pduList) {
+                    val now = System.currentTimeMillis()
+                    val tsSec = (now / 1000).toInt()
+                    val tsUsec = ((now % 1000) * 1000).toInt()
+
+                    // GSMTAP header (16 bytes) + PDU
+                    val gsmtapHeader = byteArrayOf(
+                        0x02, // Version 2
+                        0x04, // Header length (16 bytes / 4 = 4 words)
+                        0x04, // Type: UM (SMS)
+                        0x00, // Timeslot
+                        0x00, 0x00, // ARFCN
+                        0x00, // Signal dBm
+                        0x00, // SNR dB
+                        0x00, 0x00, 0x00, 0x00, // Frame number
+                        0x04, // Sub-type: SMS
+                        0x00, // Antenna number
+                        0x00, 0x00 // Sub-slot
+                    )
+
+                    val packetLen = gsmtapHeader.size + pdu.size
+
+                    // PCAP Record Header (16 bytes)
+                    writePcapInt32(fos, tsSec)
+                    writePcapInt32(fos, tsUsec)
+                    writePcapInt32(fos, packetLen)
+                    writePcapInt32(fos, packetLen)
+
+                    fos.write(gsmtapHeader)
+                    fos.write(pdu)
+                }
+            }
+            Log.i(TAG, "PCAP export: ${pduList.size} PDUs → $outputPath")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "PCAP export failed: ${e.message}")
+            false
+        }
+    }
+
+    private fun writePcapInt32(fos: java.io.FileOutputStream, value: Int) {
+        fos.write(value and 0xFF)
+        fos.write((value shr 8) and 0xFF)
+        fos.write((value shr 16) and 0xFF)
+        fos.write((value shr 24) and 0xFF)
     }
 }

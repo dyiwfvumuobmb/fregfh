@@ -130,6 +130,21 @@ class RadioLogMonitor(private val context: Context) {
                     lastAlertTime[type] = now
                     Log.w(TAG, "Suspicious Radio Event: $type -> $line")
                     triggerAlert(type, "Detected via Radio Log: ${match.value}")
+
+                    // Feed auth/attach rejects into RilDefenderEngine for advanced analysis
+                    when (type) {
+                        "AUTH_REJECT" -> {
+                            val cause = Regex("cause.*#?(\\d+)").find(line)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
+                            RilDefenderEngine.recordAuthReject(cause)
+                        }
+                        "IMSI_ATTACH_ANOMALY" -> {
+                            val cause = Regex("cause.*#?(\\d+)").find(line)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
+                            RilDefenderEngine.recordAttachReject(cause)
+                        }
+                        "5G_DOWNGRADE_ATTACK", "SA_TO_NSA_DOWNGRADE", "NR_FORCED_HANDOVER" -> {
+                            RilDefenderEngine.detectDowngradeAttack()
+                        }
+                    }
                 }
             }
         }

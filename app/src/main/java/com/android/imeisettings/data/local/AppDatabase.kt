@@ -11,9 +11,9 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 @Database(
     entities = [
         SecurityLog::class, SafeZone::class, CellFingerprint::class,
-        ImeiHistory::class, ImeiBackup::class
+        ImeiHistory::class, ImeiBackup::class, CellTowerMapData::class
     ],
-    version = 9,
+    version = 10,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -22,6 +22,7 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun cellFingerprintDao(): CellFingerprintDao
     abstract fun imeiHistoryDao(): ImeiHistoryDao
     abstract fun imeiBackupDao(): ImeiBackupDao
+    abstract fun cellTowerMapDao(): CellTowerMapDao
 
     companion object {
         private const val TAG = "AppDatabase"
@@ -32,6 +33,28 @@ abstract class AppDatabase : RoomDatabase() {
         private val MIGRATION_7_8 = object : Migration(7, 8) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 Log.d(TAG, "Migrating database from version 7 to 8")
+            }
+        }
+
+        private val MIGRATION_9_10 = object : Migration(9, 10) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                Log.d(TAG, "Migrating database from version 9 to 10")
+                db.execSQL("""CREATE TABLE IF NOT EXISTS cell_tower_map (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                    cellId INTEGER NOT NULL,
+                    lac INTEGER NOT NULL,
+                    mcc INTEGER NOT NULL,
+                    mnc INTEGER NOT NULL,
+                    latitude REAL NOT NULL,
+                    longitude REAL NOT NULL,
+                    signalStrength INTEGER NOT NULL,
+                    networkType INTEGER NOT NULL,
+                    isSuspicious INTEGER NOT NULL,
+                    suspiciousReason TEXT,
+                    isVerifiedOpenCelliD INTEGER NOT NULL DEFAULT 0,
+                    anomalyScore REAL NOT NULL DEFAULT 0.0,
+                    timestamp INTEGER NOT NULL
+                )""")
             }
         }
 
@@ -59,7 +82,7 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
-        private val SAFE_MIGRATION = object : Migration(1, 9) {
+        private val SAFE_MIGRATION = object : Migration(1, 10) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 Log.d(TAG, "Safe migration: recreating tables while preserving data where possible")
                 db.execSQL("""CREATE TABLE IF NOT EXISTS security_logs (
@@ -104,6 +127,22 @@ abstract class AppDatabase : RoomDatabase() {
                     deviceModel TEXT NOT NULL DEFAULT '',
                     isRestored INTEGER NOT NULL DEFAULT 0
                 )""")
+                db.execSQL("""CREATE TABLE IF NOT EXISTS cell_tower_map (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                    cellId INTEGER NOT NULL,
+                    lac INTEGER NOT NULL,
+                    mcc INTEGER NOT NULL,
+                    mnc INTEGER NOT NULL,
+                    latitude REAL NOT NULL,
+                    longitude REAL NOT NULL,
+                    signalStrength INTEGER NOT NULL,
+                    networkType INTEGER NOT NULL,
+                    isSuspicious INTEGER NOT NULL,
+                    suspiciousReason TEXT,
+                    isVerifiedOpenCelliD INTEGER NOT NULL DEFAULT 0,
+                    anomalyScore REAL NOT NULL DEFAULT 0.0,
+                    timestamp INTEGER NOT NULL
+                )""")
             }
         }
 
@@ -114,7 +153,7 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "consul_imei_db"
                 )
-                    .addMigrations(MIGRATION_7_8, MIGRATION_8_9, SAFE_MIGRATION)
+                    .addMigrations(MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, SAFE_MIGRATION)
                     .fallbackToDestructiveMigration()
                     .build()
                 INSTANCE = instance

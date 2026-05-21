@@ -163,8 +163,27 @@ class ImeiRotationWorker(
             val oldImei1 = DeviceIdentifierUtil.getImei(applicationContext, 0)
             val oldImei2 = DeviceIdentifierUtil.getImei(applicationContext, 1)
 
-            var newImei1 = ImeiGenerator.generateImei()
-            var newImei2 = ImeiGenerator.generateImei()
+            // Smart TAC selection: use same manufacturer TAC prefix for realism
+            val oldTac1 = if (oldImei1.length >= 8) oldImei1.substring(0, 8) else null
+            val matchingModels = if (oldTac1 != null) {
+                ImeiGenerator.models.filter { it.tac == oldTac1 }
+            } else emptyList()
+            val selectedTac = matchingModels.firstOrNull()?.tac
+
+            var newImei1 = ImeiGenerator.generateImei(selectedTac)
+            var newImei2 = ImeiGenerator.generateImei(selectedTac)
+
+            // Ensure generated IMEIs pass Luhn validation
+            var safetyCounter = 0
+            while (!ImeiGenerator.isValidImei(newImei1) && safetyCounter < 10) {
+                newImei1 = ImeiGenerator.generateImei(selectedTac)
+                safetyCounter++
+            }
+            safetyCounter = 0
+            while (!ImeiGenerator.isValidImei(newImei2) && safetyCounter < 10) {
+                newImei2 = ImeiGenerator.generateImei(selectedTac)
+                safetyCounter++
+            }
 
             val preventRepeats = settings.preventRepeats.first()
             if (preventRepeats) {
@@ -172,13 +191,13 @@ class ImeiRotationWorker(
                 val history = db.imeiHistoryDao().getAllHistory().first()
                 val usedImeis = history.flatMap { listOf(it.sim1NewImei, it.sim2NewImei) }.toSet()
                 var attempts = 0
-                while ((newImei1 == oldImei1 || newImei1 in usedImeis) && attempts < 20) {
-                    newImei1 = ImeiGenerator.generateImei()
+                while ((newImei1 == oldImei1 || newImei1 in usedImeis || !ImeiGenerator.isValidImei(newImei1)) && attempts < 50) {
+                    newImei1 = ImeiGenerator.generateImei(selectedTac)
                     attempts++
                 }
                 attempts = 0
-                while ((newImei2 == oldImei2 || newImei2 in usedImeis) && attempts < 20) {
-                    newImei2 = ImeiGenerator.generateImei()
+                while ((newImei2 == oldImei2 || newImei2 in usedImeis || newImei2 == newImei1 || !ImeiGenerator.isValidImei(newImei2)) && attempts < 50) {
+                    newImei2 = ImeiGenerator.generateImei(selectedTac)
                     attempts++
                 }
             }

@@ -115,7 +115,12 @@ object CpuUtil {
             name.contains("unisoc") || name.contains("spreadtrum") || name.contains("sp98") ||
             name.contains("ums") || name.contains("t930") || name.contains("t950") ||
             name.contains("t7525") || name.contains("t8200") || name.contains("t770") ||
-            name.contains("t760") || name.contains("t820") || name.contains("t900") -> CpuType.UNISOC
+            name.contains("t760") || name.contains("t820") || name.contains("t900") ||
+            name.contains("sc9863") || name.contains("sc9832") || name.contains("t606") ||
+            name.contains("t610") || name.contains("t612") || name.contains("t616") ||
+            name.contains("t700") || name.contains("t710") || name.contains("t618") ||
+            name.contains("sc7731") || name.contains("sc9850") || name.contains("t310") ||
+            name.contains("t312") || name.contains("t507") || name.contains("t509") -> CpuType.UNISOC
 
             else -> CpuType.UNKNOWN
         }.also { cachedCpuType = it }

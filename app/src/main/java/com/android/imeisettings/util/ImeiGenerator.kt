@@ -147,6 +147,31 @@ object ImeiGenerator {
         return imei14 + calculateLuhnCheckDigit(imei14)
     }
 
+    fun generateImeiForModel(modelName: String): String? {
+        val model = models.find { it.name.equals(modelName, ignoreCase = true) }
+            ?: models.find { it.name.contains(modelName, ignoreCase = true) }
+            ?: return null
+        return generateImei(model.tac)
+    }
+
+    fun generateImeiForBrand(brand: String): String {
+        val brandModels = models.filter { it.name.contains(brand, ignoreCase = true) }
+        val selectedModel = if (brandModels.isNotEmpty()) brandModels.random() else models.random()
+        return generateImei(selectedModel.tac)
+    }
+
+    fun getModelByTac(tac: String): DeviceModel? {
+        return models.find { it.tac == tac }
+    }
+
+    fun getModelsForBrand(brand: String): List<DeviceModel> {
+        return models.filter { it.name.contains(brand, ignoreCase = true) }
+    }
+
+    fun getAllBrands(): List<String> {
+        return models.map { it.name.substringBefore(" ") }.distinct().sorted()
+    }
+
     fun isValidImei(imei: String): Boolean {
         if (imei.length != 15) return false
         if (!imei.all { it.isDigit() }) return false

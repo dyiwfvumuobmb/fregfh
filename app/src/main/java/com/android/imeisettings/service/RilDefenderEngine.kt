@@ -372,6 +372,174 @@ object RilDefenderEngine {
     }
 
     // ═══════════════════════════════════════════
+    // ML-Based Signal Pattern Analysis
+    // ═══════════════════════════════════════════
+
+    private val networkTypeHistory = CopyOnWriteArrayList<Pair<Long, Int>>()
+    private val authRejectTimestamps = CopyOnWriteArrayList<Long>()
+    private val attachRejectTimestamps = CopyOnWriteArrayList<Long>()
+
+    data class SignalCluster(
+        val meanRssi: Double,
+        val stdDev: Double,
+        val sampleCount: Int,
+        val anomalyScore: Double
+    )
+
+    fun analyzeSignalPatterns(): SignalCluster? {
+        if (signalHistory.size < 20) return null
+
+        val recent = signalHistory.takeLast(50)
+        val mean = recent.average()
+        val stdDev = kotlin.math.sqrt(recent.map { (it - mean) * (it - mean) }.average())
+
+        // Isolation Forest-inspired anomaly score:
+        // Score based on deviation from expected urban signal range (-90 to -50 dBm)
+        val expectedMean = -70.0
+        val expectedStdDev = 12.0
+
+        val meanDeviation = kotlin.math.abs(mean - expectedMean) / expectedStdDev
+        val varianceAnomaly = if (stdDev < 1.0) 3.0 else if (stdDev > 25.0) 2.0 else 0.0
+        val strengthAnomaly = if (mean > -40) 4.0 else if (mean > -30) 5.0 else 0.0
+
+        val anomalyScore = (meanDeviation + varianceAnomaly + strengthAnomaly) / 3.0
+
+        val cluster = SignalCluster(mean, stdDev, recent.size, anomalyScore)
+
+        if (anomalyScore > 2.0) {
+            Log.w(TAG, "ML Signal Analysis: Anomaly detected — score=${anomalyScore}, mean=${mean}dBm, stdDev=${stdDev}")
+            NetworkStateTracker.forceForensicThreat(
+                (60 + (anomalyScore * 10).toInt().coerceAtMost(35)),
+                "Signal anomaly cluster: score=%.2f, μ=%.1f dBm, σ=%.1f".format(anomalyScore, mean, stdDev)
+            )
+        }
+
+        return cluster
+    }
+
+    fun detectKMeansAnomaly(): Boolean {
+        if (signalHistory.size < 30) return false
+
+        val recent = signalHistory.takeLast(30)
+
+        // Simple 2-cluster K-means: split signals into "normal" and "anomalous"
+        var centroid1 = recent.first().toDouble()
+        var centroid2 = recent.last().toDouble()
+
+        repeat(10) {
+            val cluster1 = recent.filter { kotlin.math.abs(it - centroid1) <= kotlin.math.abs(it - centroid2) }
+            val cluster2 = recent.filter { kotlin.math.abs(it - centroid2) < kotlin.math.abs(it - centroid1) }
+            if (cluster1.isNotEmpty()) centroid1 = cluster1.average()
+            if (cluster2.isNotEmpty()) centroid2 = cluster2.average()
+        }
+
+        val gap = kotlin.math.abs(centroid1 - centroid2)
+        // Large gap between clusters suggests FBS appeared/disappeared
+        if (gap > 30) {
+            Log.w(TAG, "K-means anomaly: signal clusters at %.1f and %.1f dBm (gap=%.1f)".format(centroid1, centroid2, gap))
+            return true
+        }
+        return false
+    }
+
+    // ═══════════════════════════════════════════
+    // Network Downgrade Attack Detection (5G→4G→2G)
+    // ═══════════════════════════════════════════
+
+    fun recordNetworkType(networkType: Int) {
+        val now = System.currentTimeMillis()
+        networkTypeHistory.add(now to networkType)
+        networkTypeHistory.removeAll { now - it.first > 300_000L } // 5 min window
+    }
+
+    fun detectDowngradeAttack(): Boolean {
+        if (networkTypeHistory.size < 3) return false
+
+        val recent = networkTypeHistory.sortedBy { it.first }.takeLast(10)
+
+        // Detect step-down pattern: 5G→4G or 4G→2G within short time
+        for (i in 1 until recent.size) {
+            val prev = recent[i - 1]
+            val curr = recent[i]
+            val timeDelta = curr.first - prev.first
+
+            if (timeDelta < 30_000L) { // Within 30 seconds
+                val prevGen = networkTypeToGeneration(prev.second)
+                val currGen = networkTypeToGeneration(curr.second)
+
+                if (prevGen > currGen && prevGen - currGen >= 1) {
+                    // Check for cascade: 5G→4G→2G
+                    if (i >= 2) {
+                        val prevPrev = recent[i - 2]
+                        val prevPrevGen = networkTypeToGeneration(prevPrev.second)
+                        if (prevPrevGen > prevGen && curr.first - prevPrev.first < 60_000L) {
+                            Log.w(TAG, "CASCADE downgrade: ${prevPrevGen}G→${prevGen}G→${currGen}G in <60s")
+                            NetworkStateTracker.forceForensicThreat(90, "Cascade network downgrade: ${prevPrevGen}G→${prevGen}G→${currGen}G")
+                            return true
+                        }
+                    }
+
+                    if (prevGen - currGen >= 2) {
+                        Log.w(TAG, "Severe downgrade: ${prevGen}G→${currGen}G in ${timeDelta}ms")
+                        NetworkStateTracker.forceForensicThreat(85, "Network downgrade attack: ${prevGen}G→${currGen}G")
+                        return true
+                    }
+                }
+            }
+        }
+        return false
+    }
+
+    private fun networkTypeToGeneration(type: Int): Int {
+        return when (type) {
+            // 5G NR
+            20 -> 5 // TelephonyManager.NETWORK_TYPE_NR
+            // 4G LTE
+            13, 19 -> 4 // LTE, LTE_CA
+            // 3G
+            3, 8, 9, 10, 15 -> 3 // UMTS, HSDPA, HSUPA, HSPA, HSPAP
+            // 2G
+            1, 2, 4, 7, 11, 16 -> 2 // GPRS, EDGE, CDMA, 1xRTT, iDEN, GSM
+            else -> 0
+        }
+    }
+
+    // ═══════════════════════════════════════════
+    // Authentication/Attach Reject Analysis
+    // ═══════════════════════════════════════════
+
+    fun recordAuthReject(cause: Int) {
+        val now = System.currentTimeMillis()
+        authRejectTimestamps.add(now)
+        authRejectTimestamps.removeAll { now - it > 120_000L }
+
+        Log.w(TAG, "Auth Reject recorded, cause=$cause, count=${authRejectTimestamps.size}")
+
+        // More than 2 auth rejects in 2 minutes is highly suspicious
+        if (authRejectTimestamps.size >= 2) {
+            NetworkStateTracker.forceForensicThreat(85, "Multiple Authentication Rejects ($cause) — IMSI catcher probing")
+        }
+    }
+
+    fun recordAttachReject(cause: Int) {
+        val now = System.currentTimeMillis()
+        attachRejectTimestamps.add(now)
+        attachRejectTimestamps.removeAll { now - it > 120_000L }
+
+        Log.w(TAG, "Attach Reject recorded, cause=$cause, count=${attachRejectTimestamps.size}")
+
+        // EMM cause codes indicating IMSI catcher activity
+        val suspiciousCauses = setOf(3, 6, 7, 8, 11, 12, 13, 14, 15, 25)
+        if (cause in suspiciousCauses) {
+            NetworkStateTracker.forceForensicThreat(80, "Attach Reject with suspicious cause #$cause")
+        }
+
+        if (attachRejectTimestamps.size >= 3) {
+            NetworkStateTracker.forceForensicThreat(90, "Repeated Attach Rejects (${attachRejectTimestamps.size}x) — active IMSI catcher")
+        }
+    }
+
+    // ═══════════════════════════════════════════
     // SMS Analysis (from RILDefender GsmInboundSmsHandler patch)
     // ═══════════════════════════════════════════
 
