@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Outer Hexagonal Frame (Tech Glow) -->
+    <path
+        android:fillColor="#157C8CCF"
+        android:pathData="M54,15 L88,35 L88,73 L54,93 L20,73 L20,35 Z" />
+
+    <path
+        android:strokeWidth="2"
+        android:strokeColor="#7C8CCF"
+        android:pathData="M54,18 L85,36 L85,72 L54,90 L23,72 L23,36 Z" />
+
+    <!-- Inner Circuit Details -->
+    <path
+        android:fillColor="#7C8CCF"
+        android:pathData="M54,25 L56,25 L56,35 L54,35 Z M54,73 L56,73 L56,83 L54,83 Z" />
+
+    <path
+        android:fillColor="#7C8CCF"
+        android:pathData="M28,40 L35,36 L37,38 L30,42 Z M71,70 L78,74 L80,72 L73,68 Z" />
+
+    <!-- Core Shield (Security) -->
+    <path
+        android:fillColor="#7C8CCF"
+        android:pathData="M54,38 C46,38 40,42 38,45 C38,55 40,65 54,75 C68,65 70,55 70,45 C68,42 62,38 54,38 Z" />
+
+    <!-- Center 'Eye' or Signal Core -->
+    <path
+        android:fillColor="#121216"
+        android:pathData="M54,44 C50,44 46,47 46,51 C46,55 50,58 54,58 C58,58 62,55 62,51 C62,47 58,44 54,44 Z" />
+
+    <path
+        android:fillColor="#7C8CCF"
+        android:pathData="M54,48 C52,48 51,49 51,51 C51,53 52,54 54,54 C56,54 57,53 57,51 C57,49 56,48 54,48 Z" />
+
+    <!-- Scanning Line (Horizontal Highlight) -->
+    <path
+        android:fillColor="#40FFFFFF"
+        android:pathData="M25,53 L83,53 L83,55 L25,55 Z" />
+
+</vector>
