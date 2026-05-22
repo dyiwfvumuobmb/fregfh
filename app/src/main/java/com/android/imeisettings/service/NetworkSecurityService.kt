@@ -56,6 +56,8 @@ class NetworkSecurityService : Service() {
     private var radioLogMonitor: RadioLogMonitor? = null
     private var lastCleanupTime = 0L
     private var lastNetworkMccMnc = ""
+    private var lastAlertTime = 0L
+    private var forensicLowCount = 0
     private var lastScanCellId = "---"
     private var lastScanLacTac = "---"
     private var lastScanDbm = -140
@@ -573,12 +575,9 @@ class NetworkSecurityService : Service() {
                         lastAlertedCellId = ""
                     }
 
-                    if (!NetworkStateTracker.forensicThreatActive) {
-                        NetworkStateTracker.updateThreatLevel(threatLevel)
-                        updateNotification(threatLevel, currentLang)
-                    } else {
-                        updateNotification(100, currentLang)
-                    }
+                    // updateNetworkData now returns effective threat (max of scan + forensic)
+                    NetworkStateTracker.updateThreatLevel(threatLevel)
+                    updateNotification(threatLevel, currentLang)
 
                     // Kill Switch: trigger only if enabled in settings
                     if (threatLevel >= 76) {
@@ -791,19 +790,23 @@ class NetworkSecurityService : Service() {
             val isProvidingData = isCellularData && sub.subscriptionId == defaultDataSubId
             val threatReasons = mutableListOf<String>()
             var threat = 0
+            var factorCount = 0
             
-            if (networkType == "GSM") { threat += 25; threatReasons.add(r["t_gsm"] ?: "2G") }
+            // === Weight system (max 100%) ===
+            // ASN mismatch = 50%, No neighbors = 25%, everything else = 5-10%
+            
+            if (networkType == "GSM") { threat += 10; factorCount++; threatReasons.add(r["t_gsm"] ?: "2G") }
             if (neighborsCount == 0 && cellId != "---" && !networkType.contains("searching", ignoreCase = true)) {
                 if (isCallActive) {
-                    threat += 5
+                    threat += 5; factorCount++
                     threatReasons.add(r["neighbors_0_weak_log"] ?: "No neighbors")
                 } else {
-                    if (dbm > -55) { threat += 100; threatReasons.add(r["neighbors_0_strong"] ?: "FakeBS") }
-                    else { threat += 25; threatReasons.add(r["neighbors_0_weak_log"] ?: "No neighbors") }
+                    threat += 25; factorCount++
+                    threatReasons.add(r["neighbors_0_weak_log"] ?: "No neighbors")
                 }
             }
             if (encryption.contains("NONE") || encryption.contains("EEA0") || encryption.contains("A5/0")) {
-                if (!isCallActive) threat += 100 else threat += 50
+                threat += 10; factorCount++
                 threatReasons.add(r["t_cipher"] ?: "Cipher")
             }
 
@@ -813,6 +816,7 @@ class NetworkSecurityService : Service() {
             )
             if (fbsResult.additionalThreat > 0) {
                 threat += fbsResult.additionalThreat
+                factorCount += fbsResult.factorCount
                 threatReasons.addAll(fbsResult.reasons)
             }
             
@@ -821,7 +825,7 @@ class NetworkSecurityService : Service() {
                 for (zone in inMemorySafeZones) {
                     if (zone.mccMnc == currentMccMnc && zone.lacTac == lacTac) {
                         if (!zone.trustedCellIds.split(",").contains(cellId)) {
-                            threat = 100; threatReasons.add(r["t_geo"] ?: "Geo")
+                            threat = 100; factorCount++; threatReasons.add(r["t_geo"] ?: "Geo")
                             val msg = "Critical: Unknown Tower $cellId in Safe Area ${zone.name}!"
                             if (cellId != lastAlertedCellId) {
                                 lastAlertedCellId = cellId
@@ -837,7 +841,7 @@ class NetworkSecurityService : Service() {
             if (isProvidingData && lastAsnNumber.isNotEmpty() && lastAsnInfo != "Loading..." &&
                 !AsnDatabase.isAsnValidForSim("${sub.mccString} / ${sub.mncString}", lastAsnNumber, lastAsnInfo) &&
                 !userTrusted.contains(lastAsnNumber)) {
-                threat += 50; threatReasons.add(r["t_asn"] ?: "ASN")
+                threat += 50; factorCount++; threatReasons.add(r["t_asn"] ?: "ASN")
             }
             
             // Learning Mode Logic
@@ -907,36 +911,54 @@ class NetworkSecurityService : Service() {
             }
         }
 
+        // Also consider forensic threat level for effective display
+        val forensicLevel = if (NetworkStateTracker.forensicThreatActive) NetworkStateTracker.totalThreatLevel.value else 0
+        val effectiveThreat = maxOf(maxThreat, forensicLevel)
+
         val logDetails = logEntries.joinToString("\n\n")
-        if (maxThreat != lastThreatLevel || infoChanged || System.currentTimeMillis() - lastLogTime > 30000) {
+        if (effectiveThreat != lastThreatLevel || infoChanged || System.currentTimeMillis() - lastLogTime > 30000) {
             serviceScope.launch { db.securityLogDao().insertLog(SecurityLog(0, System.currentTimeMillis(), "MONITOR", logDetails)) }
-            if (maxThreat >= 76 && lastThreatLevel < 76) {
+            // Alert triggers when: effective threat >= 76% AND this is a new alert (wasn't >= 76 before)
+            // Cooldown: at least 60 seconds between alerts to avoid spam
+            val now = System.currentTimeMillis()
+            if (effectiveThreat >= 76 && (lastThreatLevel < 76 || now - lastAlertTime > 60_000L)) {
+                lastAlertTime = now
                 val reason = logDetails
                 triggerEmergencyOverlay(
                     r["sec_threat"] ?: "SECURITY THREAT", reason, lang,
-                    cellId = lastScanCellId, threatLevel = maxThreat, rssi = lastScanDbm,
+                    cellId = lastScanCellId, threatLevel = effectiveThreat, rssi = lastScanDbm,
                     lacTac = lastScanLacTac, networkType = lastScanNetworkType,
                     encryption = lastScanEncryption, neighbors = lastScanNeighbors
                 )
             }
             // Send BLE alert to connected wearables when threat changes
-            if (maxThreat != lastThreatLevel && maxThreat > 0 && WearAlertService.isActive()) {
+            if (effectiveThreat != lastThreatLevel && effectiveThreat > 0 && WearAlertService.isActive()) {
                 try {
                     val shortReason = logDetails.lines()
                         .filter { it.trimStart().startsWith("\u26a1") }
                         .joinToString(", ") { it.trim().removePrefix("\u26a1 ") }
-                        .ifEmpty { "Threat: $maxThreat%" }
-                    WearAlertService.sendAlert(maxThreat, shortReason)
+                        .ifEmpty { "Threat: $effectiveThreat%" }
+                    WearAlertService.sendAlert(effectiveThreat, shortReason)
                 } catch (_: Exception) {}
             }
-            lastThreatLevel = maxThreat; lastLogTime = System.currentTimeMillis()
+            lastThreatLevel = effectiveThreat; lastLogTime = System.currentTimeMillis()
         }
-        return if (anySimPresent) maxThreat else -1
+        // Reset forensic threat if scan-computed threat is below threshold for 3 consecutive scans
+        if (NetworkStateTracker.forensicThreatActive && maxThreat < 50) {
+            forensicLowCount++
+            if (forensicLowCount >= 3) {
+                NetworkStateTracker.resetThreatLevel()
+                forensicLowCount = 0
+            }
+        } else {
+            forensicLowCount = 0
+        }
+        return if (anySimPresent) effectiveThreat else -1
     }
 
     // ==================== ENHANCED FBS DETECTION ====================
 
-    data class FbsDetectionResult(val additionalThreat: Int, val reasons: List<String>)
+    data class FbsDetectionResult(val additionalThreat: Int, val reasons: List<String>, val factorCount: Int = 0)
 
     // Cell tower history: tracks recently seen cell IDs with their LAC and signal levels
     private val cellTowerHistory = java.util.concurrent.ConcurrentHashMap<String, CellHistoryEntry>()
@@ -993,13 +1015,17 @@ class NetworkSecurityService : Service() {
         tm: TelephonyManager, cellId: String, lacTac: String, arfcn: String,
         dbm: Int, networkType: String, neighborsCount: Int, isCallActive: Boolean
     ): FbsDetectionResult {
-        if (cellId == "---" || cellId.isEmpty()) return FbsDetectionResult(0, emptyList())
+        if (cellId == "---" || cellId.isEmpty()) return FbsDetectionResult(0, emptyList(), 0)
 
         var additionalThreat = 0
+        var factors = 0
         val reasons = mutableListOf<String>()
 
         try {
-            // 1. Timing Advance anomaly (GSM/LTE) — very low TA = tower is too close (portable FBS)
+            // 1. Timing Advance anomaly (GSM/LTE)
+            // TA=0..1 means tower within 78m (LTE) or 550m (GSM).
+            // This is NORMAL in urban areas — only add 5% as a minor indicator,
+            // and ONLY when TA=0 with very strong signal (truly suspicious).
             val allCells = try { tm.allCellInfo ?: emptyList() } catch (_: Exception) { emptyList() }
             for (cell in allCells) {
                 val isServing = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R)
@@ -1011,56 +1037,56 @@ class NetworkSecurityService : Service() {
                 when (cell) {
                     is CellInfoLte -> {
                         val ta = cell.cellSignalStrength.timingAdvance
-                        if (ta != Int.MAX_VALUE && ta in 0..1) {
-                            additionalThreat += 30
-                            reasons.add("FBS: Timing Advance=$ta (tower <78m)")
+                        if (ta != Int.MAX_VALUE && ta == 0 && dbm > -50) {
+                            additionalThreat += 5; factors++
+                            reasons.add("Timing Advance=$ta (tower <78m)")
                         }
                     }
                     is CellInfoGsm -> {
                         val ta = cell.cellSignalStrength.timingAdvance
-                        if (ta != Int.MAX_VALUE && ta in 0..1) {
-                            additionalThreat += 30
-                            reasons.add("FBS: TA=$ta GSM (tower <550m)")
+                        if (ta != Int.MAX_VALUE && ta == 0 && dbm > -50) {
+                            additionalThreat += 5; factors++
+                            reasons.add("TA=$ta GSM (tower <550m)")
                         }
                     }
                 }
             }
 
-            // 2. LAC/TAC anomaly — sudden LAC change without location change
+            // 2. LAC/TAC anomaly — sudden LAC change without location change (10%)
             val history = cellTowerHistory[cellId]
             if (history != null && history.lacTac != lacTac) {
-                additionalThreat += 40
-                reasons.add("FBS: LAC changed ${history.lacTac}->$lacTac for same CID")
+                additionalThreat += 10; factors++
+                reasons.add("LAC changed ${history.lacTac}->$lacTac for same CID")
                 serviceScope.launch {
                     db.securityLogDao().insertLog(SecurityLog(0, System.currentTimeMillis(), "FBS_LAC",
                         "LAC anomaly: CID $cellId changed LAC from ${history.lacTac} to $lacTac"))
                 }
             }
 
-            // 3. ARFCN anomaly — frequency changed for same cell
+            // 3. ARFCN anomaly — frequency changed for same cell (5%)
             if (history != null && history.arfcn != "---" && arfcn != "---" && history.arfcn != arfcn) {
-                additionalThreat += 25
-                reasons.add("FBS: ARFCN changed ${history.arfcn}->$arfcn for CID $cellId")
+                additionalThreat += 5; factors++
+                reasons.add("ARFCN changed ${history.arfcn}->$arfcn for CID $cellId")
             }
 
-            // 4. Signal strength anomaly — sudden large jump (>20dBm) in signal
+            // 4. Signal strength anomaly — sudden large jump (>20dBm) in signal (10%)
             if (history != null && history.dbmHistory.isNotEmpty()) {
                 val avgDbm = history.dbmHistory.takeLast(5).average()
                 val jump = dbm - avgDbm
                 if (jump > 20 && dbm > -60) {
-                    additionalThreat += 35
-                    reasons.add("FBS: Signal jump +${jump.toInt()}dBm (avg=${avgDbm.toInt()}, now=$dbm)")
+                    additionalThreat += 10; factors++
+                    reasons.add("Signal jump +${jump.toInt()}dBm (avg=${avgDbm.toInt()}, now=$dbm)")
                 }
             }
 
-            // 5. CID too low — portable IMSI catchers often use very low CIDs
+            // 5. CID too low — portable IMSI catchers often use very low CIDs (5%)
             val cidNum = cellId.toLongOrNull()
             if (cidNum != null && cidNum in 1..10 && !isCallActive) {
-                additionalThreat += 20
-                reasons.add("FBS: Suspicious low CID=$cellId")
+                additionalThreat += 5; factors++
+                reasons.add("Suspicious low CID=$cellId")
             }
 
-            // 6. Neighbor cell signal analysis — all neighbors weaker by >30dB = isolation attack
+            // 6. Neighbor cell signal analysis — all neighbors weaker by >30dB = isolation attack (10%)
             if (neighborsCount > 0 && !isCallActive) {
                 val neighborDbms = allCells
                     .filter { cell ->
@@ -1075,82 +1101,78 @@ class NetworkSecurityService : Service() {
                     val maxNeighborDbm = neighborDbms.max()
                     val gap = dbm - maxNeighborDbm
                     if (gap > 30 && dbm > -60) {
-                        additionalThreat += 30
-                        reasons.add("FBS: Signal isolation gap=${gap}dB (serving=$dbm, best neighbor=$maxNeighborDbm)")
+                        additionalThreat += 10; factors++
+                        reasons.add("Signal isolation gap=${gap}dB (serving=$dbm, best neighbor=$maxNeighborDbm)")
                     }
                 }
             }
 
-            // 7. Network downgrade detection — was on LTE/5G, suddenly on GSM
+            // 7. Network downgrade detection — was on LTE/5G, suddenly on GSM (10%)
             if (history != null && networkType == "GSM") {
                 val prevEntry = cellTowerHistory.values
                     .filter { it.lastSeen > System.currentTimeMillis() - 60_000 }
                     .maxByOrNull { it.lastSeen }
-                // If we were recently on a higher-tech cell, downgrade is suspicious
                 if (prevEntry != null && prevEntry.cellId != cellId) {
-                    additionalThreat += 15
-                    reasons.add("FBS: Downgrade to 2G detected")
+                    additionalThreat += 10; factors++
+                    reasons.add("Downgrade to 2G detected")
                 }
             }
 
-            // 8. Signal Strength Statistical Anomaly (AIMSICD-style)
+            // 8. Signal Strength Statistical Anomaly — AIMSICD-style (5% max)
             val cidInt = cellId.toIntOrNull()
             if (cidInt != null && dbm > -140 && !isCallActive) {
                 val (sigThreat, sigMsg) = checkSignalStrengthAnomaly(cidInt, dbm)
                 if (sigThreat > 0 && sigMsg != null) {
-                    additionalThreat += sigThreat
-                    reasons.add("FBS: $sigMsg")
+                    additionalThreat += minOf(sigThreat, 5); factors++
+                    reasons.add(sigMsg)
                 }
             }
 
-            // 9. 5G NR cell analysis — check for NSA anchor anomalies
+            // 9. 5G NR cell analysis — check for NSA anchor anomalies (5%)
             for (cell in allCells) {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && cell is android.telephony.CellInfoNr) {
                     val nrIdentity = cell.cellIdentity as? android.telephony.CellIdentityNr
                     val nrSs = cell.cellSignalStrength as? android.telephony.CellSignalStrengthNr
                     if (nrIdentity != null && nrSs != null) {
-                        val nrci = nrIdentity.nci
                         val nrPci = nrIdentity.pci
-                        // NR cells with PCI 0-2 are suspicious (commonly used by test equipment)
                         if (nrPci in 0..2) {
-                            additionalThreat += 20
-                            reasons.add("FBS: Suspicious 5G NR PCI=$nrPci (test range)")
+                            additionalThreat += 5; factors++
+                            reasons.add("Suspicious 5G NR PCI=$nrPci (test range)")
                         }
-                        // 5G cell with no neighbors and very strong signal = potential rogue gNodeB
                         val ssRsrp = nrSs.ssRsrp
                         if (ssRsrp > -60 && neighborsCount == 0) {
-                            additionalThreat += 25
-                            reasons.add("FBS: Isolated 5G NR cell RSRP=${ssRsrp}dBm, no neighbors")
+                            additionalThreat += 10; factors++
+                            reasons.add("Isolated 5G NR cell RSRP=${ssRsrp}dBm, no neighbors")
                         }
                     }
                 }
             }
 
-            // 10. Multi-RAT consistency check — if serving cell RAT doesn't match network type
+            // 10. Multi-RAT consistency check (5%)
             if (networkType == "5G") {
                 val hasNrCell = allCells.any { Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && it is android.telephony.CellInfoNr }
                 if (!hasNrCell && dbm > -80) {
-                    additionalThreat += 15
-                    reasons.add("FBS: 5G indicated but no NR cell info available (possible spoofed indicator)")
+                    additionalThreat += 5; factors++
+                    reasons.add("5G indicated but no NR cell info (possible spoofed)")
                 }
             }
 
-            // 11. Cell tower lifetime check — newly appeared tower with very strong signal
+            // 11. Cell tower lifetime check — newly appeared tower with very strong signal (5%)
             if (history == null && dbm > -55 && !isCallActive) {
-                additionalThreat += 20
-                reasons.add("FBS: New tower CID=$cellId with unusually strong signal ${dbm}dBm")
+                additionalThreat += 5; factors++
+                reasons.add("New tower CID=$cellId with strong signal ${dbm}dBm")
             }
 
-            // 12. RRC redirect detection — rapid cell changes within short time
+            // 12. RRC redirect detection — rapid cell changes within short time (10%)
             val recentChanges = cellTowerHistory.values.count {
                 System.currentTimeMillis() - it.lastSeen < 30_000 && it.cellId != cellId
             }
             if (recentChanges >= 3) {
-                additionalThreat += 25
-                reasons.add("FBS: Rapid cell switching ($recentChanges changes in 30s) — possible RRC redirect attack")
+                additionalThreat += 10; factors++
+                reasons.add("Rapid cell switching ($recentChanges changes in 30s)")
             }
 
-            // 13. Extended TA analysis for NR (5G)
+            // 13. Extended TA analysis for NR (5G) — extremely strong signal (10%)
             for (cell in allCells) {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && cell is android.telephony.CellInfoNr) {
                     val isServing = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R)
@@ -1161,16 +1183,15 @@ class NetworkSecurityService : Service() {
                     val nrSs = cell.cellSignalStrength as? android.telephony.CellSignalStrengthNr
                     if (nrSs != null) {
                         val ssRsrp = nrSs.ssRsrp
-                        // Extremely strong 5G signal with no neighbors = rogue gNodeB
                         if (ssRsrp > -50 && neighborsCount <= 1 && !isCallActive) {
-                            additionalThreat += 35
-                            reasons.add("FBS: Extremely strong 5G NR signal ${ssRsrp}dBm with ${neighborsCount} neighbors")
+                            additionalThreat += 10; factors++
+                            reasons.add("Extremely strong 5G NR signal ${ssRsrp}dBm with ${neighborsCount} neighbors")
                         }
                     }
                 }
             }
 
-            // 14. PLMN consistency check — serving cell MCC/MNC should match SIM
+            // 14. PLMN consistency check — serving cell MCC/MNC should match SIM (10%)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 for (cell in allCells) {
                     val isServing = cell.cellConnectionStatus == CellInfo.CONNECTION_PRIMARY_SERVING
@@ -1185,34 +1206,32 @@ class NetworkSecurityService : Service() {
                             simMcc.isNotEmpty() && simMnc.isNotEmpty() &&
                             (cellMcc != simMcc || cellMnc != simMnc) &&
                             tm.serviceState?.roaming != true) {
-                            additionalThreat += 40
-                            reasons.add("FBS: PLMN mismatch — cell=$cellMcc/$cellMnc, SIM=$simMcc/$simMnc (not roaming)")
+                            additionalThreat += 10; factors++
+                            reasons.add("PLMN mismatch — cell=$cellMcc/$cellMnc, SIM=$simMcc/$simMnc")
                         }
                     }
                 }
             }
 
-            // 15. Cell tower broadcast timing anomaly — FBS often have incorrect SIB periodicity
+            // 15. Cell tower broadcast timing anomaly (5%)
             if (history != null && history.firstSeen > 0) {
                 val towerAge = System.currentTimeMillis() - history.firstSeen
-                // Tower that appeared less than 5 minutes ago with very strong signal
                 if (towerAge < 300_000 && dbm > -55 && !isCallActive) {
-                    additionalThreat += 30
-                    reasons.add("FBS: Recently appeared tower (${towerAge / 1000}s ago) with strong signal ${dbm}dBm")
+                    additionalThreat += 5; factors++
+                    reasons.add("Recently appeared tower (${towerAge / 1000}s ago) with strong signal ${dbm}dBm")
                 }
             }
 
-            // 16. Encryption downgrade detection via cipher indicator
+            // 16. Encryption downgrade detection via cipher indicator (5%)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 val serviceState = tm.serviceState
                 if (serviceState != null) {
                     val nrState = try {
                         serviceState.javaClass.getMethod("getNrState").invoke(serviceState)
                     } catch (_: Exception) { null }
-                    // If NR state changes to NONE while on 5G network type, it's suspicious
                     if (networkType == "5G" && nrState?.toString() == "NONE") {
-                        additionalThreat += 20
-                        reasons.add("FBS: 5G icon showing but NR state is NONE (possible NR spoofing)")
+                        additionalThreat += 5; factors++
+                        reasons.add("5G icon showing but NR state is NONE (possible NR spoofing)")
                     }
                 }
             }
@@ -1244,17 +1263,19 @@ class NetworkSecurityService : Service() {
             Log.e(TAG, "Enhanced FBS detection error: ${e.message}")
         }
 
-        return FbsDetectionResult(additionalThreat, reasons)
+        return FbsDetectionResult(additionalThreat, reasons, factors)
     }
 
     // ==================== END ENHANCED FBS DETECTION ====================
 
     private fun getRealEncryptionType(tm: TelephonyManager, networkType: String, neighbors: Int, dbm: Int, callActive: Boolean): String {
+        // Show expected encryption for the technology.
+        // Actual cipher indicators come from radio logs, not from neighbor heuristics.
         return when (networkType) {
             "5G" -> "5G: NEA2 (AES)"
-            "LTE" -> if (neighbors == 0 && dbm > -60 && !callActive) "LTE: EEA0 (NO ENCRYPTION!)" else "LTE: EEA2 / EEA1"
+            "LTE" -> "LTE: EEA2 / EEA1"
             "3G" -> "3G: UEA2 (AES-128)"
-            "GSM" -> if (neighbors == 0 && dbm > -70 && !callActive) "2G: A5/0 (UNSECURED!)" else "2G: A5/3 (STRONG)"
+            "GSM" -> "2G: A5/3 (STRONG)"
             else -> "N/A"
         }
     }

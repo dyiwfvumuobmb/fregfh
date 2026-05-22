@@ -59,10 +59,8 @@ object NetworkStateTracker {
     }
     
     fun updateThreatLevel(level: Int, reason: String? = null) { 
-        if (!_forensicThreatActive.get()) {
-            _totalThreatLevel.value = level
-            _threatReason.value = reason
-        }
+        _totalThreatLevel.value = level
+        if (reason != null) _threatReason.value = reason
     }
     
     fun forceForensicThreat(level: Int = 100, reason: String) {

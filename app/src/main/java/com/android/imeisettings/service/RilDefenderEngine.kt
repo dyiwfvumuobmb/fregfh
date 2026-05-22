@@ -264,14 +264,14 @@ object RilDefenderEngine {
         // Check 3: Rapid cell switching — FBS causes frequent handovers
         if (detectRapidCellSwitching()) {
             Log.w(TAG, "FBS: Rapid cell switching detected")
-            NetworkStateTracker.forceForensicThreat(75, "RILDefender: Rapid cell switching (possible IMSI catcher)")
+            NetworkStateTracker.forceForensicThreat(40, "RILDefender: Rapid cell switching (possible IMSI catcher)")
             return true
         }
 
         // Check 4: Excessive TMSI reallocations — IMSI catchers frequently force TMSI realloc
         if (detectExcessiveTmsiRealloc()) {
             Log.w(TAG, "FBS: Excessive TMSI reallocation detected")
-            NetworkStateTracker.forceForensicThreat(80, "RILDefender: Excessive TMSI reallocation")
+            NetworkStateTracker.forceForensicThreat(50, "RILDefender: Excessive TMSI reallocation")
             return true
         }
 
@@ -364,7 +364,7 @@ object RilDefenderEngine {
         if (threats.isNotEmpty()) {
             val desc = threats.joinToString("; ")
             Log.w(TAG, "Unusual cell params: $desc")
-            NetworkStateTracker.forceForensicThreat(70, "RILDefender: $desc")
+            NetworkStateTracker.forceForensicThreat(35, "RILDefender: $desc")
             return true
         }
 
@@ -409,7 +409,7 @@ object RilDefenderEngine {
         if (anomalyScore > 2.0) {
             Log.w(TAG, "ML Signal Analysis: Anomaly detected — score=${anomalyScore}, mean=${mean}dBm, stdDev=${stdDev}")
             NetworkStateTracker.forceForensicThreat(
-                (60 + (anomalyScore * 10).toInt().coerceAtMost(35)),
+                (30 + (anomalyScore * 5).toInt().coerceAtMost(20)),
                 "Signal anomaly cluster: score=%.2f, μ=%.1f dBm, σ=%.1f".format(anomalyScore, mean, stdDev)
             )
         }
@@ -474,14 +474,14 @@ object RilDefenderEngine {
                         val prevPrevGen = networkTypeToGeneration(prevPrev.second)
                         if (prevPrevGen > prevGen && curr.first - prevPrev.first < 60_000L) {
                             Log.w(TAG, "CASCADE downgrade: ${prevPrevGen}G→${prevGen}G→${currGen}G in <60s")
-                            NetworkStateTracker.forceForensicThreat(90, "Cascade network downgrade: ${prevPrevGen}G→${prevGen}G→${currGen}G")
+                            NetworkStateTracker.forceForensicThreat(60, "Cascade network downgrade: ${prevPrevGen}G→${prevGen}G→${currGen}G")
                             return true
                         }
                     }
 
                     if (prevGen - currGen >= 2) {
                         Log.w(TAG, "Severe downgrade: ${prevGen}G→${currGen}G in ${timeDelta}ms")
-                        NetworkStateTracker.forceForensicThreat(85, "Network downgrade attack: ${prevGen}G→${currGen}G")
+                        NetworkStateTracker.forceForensicThreat(40, "Network downgrade attack: ${prevGen}G→${currGen}G")
                         return true
                     }
                 }
@@ -517,7 +517,7 @@ object RilDefenderEngine {
 
         // More than 2 auth rejects in 2 minutes is highly suspicious
         if (authRejectTimestamps.size >= 2) {
-            NetworkStateTracker.forceForensicThreat(85, "Multiple Authentication Rejects ($cause) — IMSI catcher probing")
+            NetworkStateTracker.forceForensicThreat(50, "Multiple Authentication Rejects ($cause) — IMSI catcher probing")
         }
     }
 
@@ -531,11 +531,11 @@ object RilDefenderEngine {
         // EMM cause codes indicating IMSI catcher activity
         val suspiciousCauses = setOf(3, 6, 7, 8, 11, 12, 13, 14, 15, 25)
         if (cause in suspiciousCauses) {
-            NetworkStateTracker.forceForensicThreat(80, "Attach Reject with suspicious cause #$cause")
+            NetworkStateTracker.forceForensicThreat(40, "Attach Reject with suspicious cause #$cause")
         }
 
         if (attachRejectTimestamps.size >= 3) {
-            NetworkStateTracker.forceForensicThreat(90, "Repeated Attach Rejects (${attachRejectTimestamps.size}x) — active IMSI catcher")
+            NetworkStateTracker.forceForensicThreat(60, "Repeated Attach Rejects (${attachRejectTimestamps.size}x) — active IMSI catcher")
         }
     }
 
@@ -753,7 +753,7 @@ object RilDefenderEngine {
 
         Log.w(TAG, "Voice call from untrusted app: $callerName (PID=$callerPid)")
         NetworkStateTracker.forceForensicThreat(
-            80, "RILDefender: Voice call from untrusted app: $callerName"
+            50, "RILDefender: Voice call from untrusted app: $callerName"
         )
         return false
     }
