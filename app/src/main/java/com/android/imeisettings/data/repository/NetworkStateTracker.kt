@@ -65,7 +65,13 @@ object NetworkStateTracker {
     
     fun forceForensicThreat(level: Int = 100, reason: String) {
         _forensicThreatActive.set(true)
-        _totalThreatLevel.value = level
+        // Use max of current and new level to prevent downgrade by a weaker event
+        val effective = maxOf(_totalThreatLevel.value, level).coerceAtMost(100)
+        _totalThreatLevel.value = effective
         _threatReason.value = reason
+    }
+
+    fun resetForensicThreat() {
+        _forensicThreatActive.set(false)
     }
 }

@@ -151,29 +151,31 @@ class RadioLogMonitor(private val context: Context) {
     }
 
     private fun triggerAlert(type: String, description: String) {
+        // Severity aligned with weight system: max 100%, most items 10-30%
+        // Only confirmed multi-factor attacks should approach 76%+ alert threshold
         val severity = when (type) {
-            "CIPHER_DISABLED", "NULL_CIPHER_MODE" -> 100
-            "SILENT_CALL", "FAKE_CELL_DETECTED", "IDENTITY_REQUEST" -> 90
-            "TYPE0_SMS", "SILENT_SMS_DELIVER", "AUTH_REJECT", "SUPI_EXPOSURE" -> 85
-            "SILENT_PING", "RIL_REJECT_CAUSE", "LOCATION_UPDATE_REJECT" -> 75
-            "BINARY_SMS", "WAP_PUSH_INJECT", "PAGING_FLOOD" -> 70
-            "IMSI_ATTACH_ANOMALY", "TRACKING_AREA_REJECT" -> 65
-            "5G_DOWNGRADE_ATTACK", "SA_TO_NSA_DOWNGRADE", "NR_FORCED_HANDOVER" -> 90
-            "TIMING_ADVANCE_ANOMALY", "ABNORMAL_POWER_CONTROL" -> 80
-            "CELL_BARRING", "EMERGENCY_REDIRECT" -> 75
-            "SILENT_REGISTRATION", "PLMN_SPOOFING" -> 85
-            "SMS_STATUS_REPORT_ABUSE" -> 70
-            "GSMA_CATEGORY_ABUSE", "RRC_REDIRECT" -> 75
-            "BASEBAND_EXPLOIT" -> 100
-            "MEASUREMENT_REPORT_FLOOD", "NAS_REJECT" -> 70
-            "RAPID_TMSI_REALLOC" -> 80
-            "SECURITY_MODE_REJECT", "NULL_INTEGRITY" -> 95
-            "REDIRECTION_LOOP" -> 75
-            "FAKE_EMERGENCY_ALERT" -> 90
-            "N2_INTERFACE_ANOMALY" -> 70
-            "BEARER_DOWNGRADE" -> 65
-            "SLICING_ATTACK" -> 75
-            else -> 60
+            "CIPHER_DISABLED", "NULL_CIPHER_MODE" -> 30
+            "SILENT_CALL", "FAKE_CELL_DETECTED", "IDENTITY_REQUEST" -> 25
+            "TYPE0_SMS", "SILENT_SMS_DELIVER", "AUTH_REJECT", "SUPI_EXPOSURE" -> 25
+            "SILENT_PING", "RIL_REJECT_CAUSE", "LOCATION_UPDATE_REJECT" -> 20
+            "BINARY_SMS", "WAP_PUSH_INJECT", "PAGING_FLOOD" -> 15
+            "IMSI_ATTACH_ANOMALY", "TRACKING_AREA_REJECT" -> 20
+            "5G_DOWNGRADE_ATTACK", "SA_TO_NSA_DOWNGRADE", "NR_FORCED_HANDOVER" -> 25
+            "TIMING_ADVANCE_ANOMALY", "ABNORMAL_POWER_CONTROL" -> 15
+            "CELL_BARRING", "EMERGENCY_REDIRECT" -> 15
+            "SILENT_REGISTRATION", "PLMN_SPOOFING" -> 25
+            "SMS_STATUS_REPORT_ABUSE" -> 10
+            "GSMA_CATEGORY_ABUSE", "RRC_REDIRECT" -> 15
+            "BASEBAND_EXPLOIT" -> 50
+            "MEASUREMENT_REPORT_FLOOD", "NAS_REJECT" -> 15
+            "RAPID_TMSI_REALLOC" -> 20
+            "SECURITY_MODE_REJECT", "NULL_INTEGRITY" -> 30
+            "REDIRECTION_LOOP" -> 15
+            "FAKE_EMERGENCY_ALERT" -> 25
+            "N2_INTERFACE_ANOMALY" -> 15
+            "BEARER_DOWNGRADE" -> 10
+            "SLICING_ATTACK" -> 15
+            else -> 10
         }
         val intent = Intent(ACTION_FORENSIC).apply {
             setPackage(context.packageName)

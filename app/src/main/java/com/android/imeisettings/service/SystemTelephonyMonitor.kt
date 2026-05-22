@@ -216,9 +216,11 @@ object SystemTelephonyMonitor {
         }
 
         if (threats.isNotEmpty()) {
-            val severity = if (threats.size >= 3) 85 else 60
+            // Additive severity: each anomaly adds 10%, capped at 50% from this source
+            val severity = (threats.size * 10).coerceAtMost(50)
             val desc = threats.joinToString("; ")
-            NetworkStateTracker.forceForensicThreat(severity, "SysTel: $desc")
+            val current = NetworkStateTracker.totalThreatLevel.value
+            NetworkStateTracker.forceForensicThreat((current + severity).coerceAtMost(100), "SysTel: $desc")
             Log.w(TAG, "Cell anomalies: $desc")
         }
     }
@@ -296,7 +298,7 @@ object SystemTelephonyMonitor {
             val emMethod = state.javaClass.getMethod("isEmergencyOnly")
             val isEmergency = emMethod.invoke(state) as? Boolean ?: false
             if (isEmergency) {
-                NetworkStateTracker.forceForensicThreat(50, "SysTel: Emergency-only service state")
+                NetworkStateTracker.forceForensicThreat(20, "SysTel: Emergency-only service state")
             }
         } catch (_: Exception) {}
 
@@ -344,7 +346,7 @@ object SystemTelephonyMonitor {
         // System apps can get raw signal values
         if (dbm > -40) {
             NetworkStateTracker.forceForensicThreat(
-                60,
+                20,
                 "SysTel: Extremely strong signal ${dbm}dBm (potential FBS proximity)"
             )
         }
@@ -362,14 +364,14 @@ object SystemTelephonyMonitor {
             if (lastDataNetworkType == TelephonyManager.NETWORK_TYPE_NR &&
                 networkType == TelephonyManager.NETWORK_TYPE_LTE) {
                 NetworkStateTracker.forceForensicThreat(
-                    65, "SysTel: 5G→LTE data downgrade (potential forced handover)"
+                    15, "SysTel: 5G→LTE data downgrade (potential forced handover)"
                 )
             }
             if (lastDataNetworkType == TelephonyManager.NETWORK_TYPE_LTE &&
                 (networkType == TelephonyManager.NETWORK_TYPE_GSM ||
                     networkType == TelephonyManager.NETWORK_TYPE_EDGE)) {
                 NetworkStateTracker.forceForensicThreat(
-                    80, "SysTel: LTE→2G data downgrade (HIGH RISK — cipher bypass)"
+                    25, "SysTel: LTE→2G data downgrade (HIGH RISK — cipher bypass)"
                 )
             }
             lastDataNetworkType = networkType
@@ -413,7 +415,7 @@ object SystemTelephonyMonitor {
                                 val drift = kotlin.math.abs(nitzTime - System.currentTimeMillis())
                                 if (drift > 300_000) { // > 5 minutes drift
                                     NetworkStateTracker.forceForensicThreat(
-                                        70,
+                                        20,
                                         "NITZ time manipulation: drift=${drift / 1000}s"
                                     )
                                 }
@@ -470,7 +472,7 @@ object SystemTelephonyMonitor {
 
         if (barred.isNotEmpty()) {
             NetworkStateTracker.forceForensicThreat(
-                70,
+                20,
                 "SysTel: Services barred by network: ${barred.joinToString()}"
             )
         }
@@ -513,7 +515,7 @@ object SystemTelephonyMonitor {
                 val count = emergencyNumbers.values.sumOf { it.size }
                 if (lastEmergencyNumberCount > 0 && count != lastEmergencyNumberCount) {
                     NetworkStateTracker.forceForensicThreat(
-                        60,
+                        10,
                         "SysTel: Emergency number list changed: $lastEmergencyNumberCount → $count"
                     )
                 }

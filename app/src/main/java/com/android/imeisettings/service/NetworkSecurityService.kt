@@ -72,6 +72,9 @@ class NetworkSecurityService : Service() {
     private val cachedCellInfo = ConcurrentHashMap<Int, Pair<Long, List<CellInfo>>>()
     // Per-slot TelephonyCallback references
     private val slotCallbacks = mutableMapOf<Int, Any>()
+    // Real cipher status from radio logs (system app can read logcat -b radio)
+    @Volatile private var realCipherDisabled = false
+    @Volatile private var realCipherDetectedAt = 0L
     private var lastScanCellId = "---"
     private var lastScanLacTac = "---"
     private var lastScanDbm = -140
@@ -353,11 +356,22 @@ class NetworkSecurityService : Service() {
                 if (action == ACTION_FORENSIC) {
                     val threat = intent.getIntExtra("threat", 0)
                     val reason = intent.getStringExtra("reason") ?: "Unknown"
+                    val eventType = intent.getStringExtra("eventType") ?: ""
                     val lang = settingsDataStore.selectedLanguage.first()
                     
                     db.securityLogDao().insertLog(SecurityLog(0, System.currentTimeMillis(), "FORENSIC", reason))
-                    NetworkStateTracker.forceForensicThreat(threat, reason)
-                    if (threat >= 76) triggerEmergencyOverlay("ATTACK DETECTED", reason, lang)
+
+                    // Track real cipher disable events from radio logs
+                    if (reason.contains("CIPHER_DISABLED") || reason.contains("NULL_CIPHER_MODE")) {
+                        realCipherDisabled = true
+                        realCipherDetectedAt = System.currentTimeMillis()
+                    }
+
+                    // Additive: combine with existing scan threat instead of replacing
+                    val currentLevel = NetworkStateTracker.totalThreatLevel.value
+                    val combinedLevel = (currentLevel + threat).coerceAtMost(100)
+                    NetworkStateTracker.forceForensicThreat(combinedLevel, reason)
+                    if (combinedLevel >= 76) triggerEmergencyOverlay("ATTACK DETECTED", reason, lang)
                 }
 
                 // Auto-rotate on SIM/network change
@@ -869,6 +883,32 @@ class NetworkSecurityService : Service() {
                 threat += fbsResult.additionalThreat
                 factorCount += fbsResult.factorCount
                 threatReasons.addAll(fbsResult.reasons)
+            }
+
+            // === OpenCelliD verification (no GPS needed — lookup by MCC/MNC/LAC/CID) ===
+            if (cellId != "---" && lacTac != "---") {
+                try {
+                    val mcc = sub.mccString?.toIntOrNull() ?: 0
+                    val mnc = sub.mncString?.toIntOrNull() ?: 0
+                    val lac = lacTac.toIntOrNull() ?: 0
+                    val cid = cellId.toLongOrNull() ?: 0L
+                    if (mcc > 0 && cid > 0) {
+                        val ocidResult = OpenCelliDClient.verifyCellTower(
+                            mcc = mcc, mnc = mnc, lac = lac, cellId = cid,
+                            observedLat = null, observedLon = null,
+                            observedSignalDbm = dbm
+                        )
+                        if (!ocidResult.isKnown) {
+                            threat += 5; factorCount++
+                            threatReasons.add("OpenCelliD: unknown")
+                        }
+                        if (ocidResult.suspiciousReasons.isNotEmpty()) {
+                            threatReasons.addAll(ocidResult.suspiciousReasons.map { "OCID: $it" })
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.d(TAG, "OpenCelliD check skipped: ${e.message}")
+                }
             }
             
             if (cellId != "---" && lacTac != "---") {
@@ -1433,8 +1473,23 @@ class NetworkSecurityService : Service() {
     // ==================== END ENHANCED FBS DETECTION ====================
 
     private fun getRealEncryptionType(tm: TelephonyManager, networkType: String, neighbors: Int, dbm: Int, callActive: Boolean): String {
-        // Show expected encryption for the technology.
-        // Actual cipher indicators come from radio logs, not from neighbor heuristics.
+        // Check if radio logs detected real cipher disable (system app privilege)
+        val cipherAge = System.currentTimeMillis() - realCipherDetectedAt
+        if (realCipherDisabled && cipherAge < 60_000) {
+            // Real cipher disable detected from logcat -b radio within last 60s
+            return when (networkType) {
+                "5G" -> "5G: NEA0 (NO ENCRYPTION!)"
+                "LTE" -> "LTE: EEA0 (NO ENCRYPTION!)"
+                "3G" -> "3G: UEA0 (NO ENCRYPTION!)"
+                "GSM" -> "2G: A5/0 (NO ENCRYPTION!)"
+                else -> "NONE"
+            }
+        }
+        // Auto-clear cipher disable flag after 60s of no new detections
+        if (realCipherDisabled && cipherAge >= 60_000) {
+            realCipherDisabled = false
+        }
+        // Default: show expected encryption for the technology
         return when (networkType) {
             "5G" -> "5G: NEA2 (AES)"
             "LTE" -> "LTE: EEA2 / EEA1"
