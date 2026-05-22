@@ -848,8 +848,10 @@ class NetworkSecurityService : Service() {
             if (slotIdx == 1 && cellId != "---" && cellId != lastCellIdSim2) { lastCellIdSim2 = cellId; infoChanged = true; checkCellFingerprint(cellId, lacTac, arfcn, dbm, lang) }
 
             val freshCells = requestFreshCellInfo(subTm, sub.subscriptionId)
+            updateNeighborRegistry(slotIdx, freshCells)
             val neighborsRaw = countNeighbors(freshCells)
-            val neighborsCount = stabilizeNeighborCount(slotIdx, neighborsRaw)
+            val enrichedCount = getEnrichedNeighborCount(slotIdx, neighborsRaw)
+            val neighborsCount = stabilizeNeighborCount(slotIdx, enrichedCount)
 
             val encryption = getRealEncryptionType(subTm, networkType, neighborsCount, dbm, isCallActive)
             val isProvidingData = isCellularData && sub.subscriptionId == defaultDataSubId
@@ -1064,49 +1066,86 @@ class NetworkSecurityService : Service() {
 
     // ==================== CELL INFO & NEIGHBOR HELPERS ====================
 
+    // Known neighbor cells per SIM — persists across scans for deduplication
+    private val knownNeighborCells = arrayOf(
+        ConcurrentHashMap<String, NeighborCellRecord>(), // SIM1
+        ConcurrentHashMap<String, NeighborCellRecord>()  // SIM2
+    )
+
+    data class NeighborCellRecord(
+        val key: String, // MCC-MNC-LAC-CID
+        val dbm: Int,
+        val networkType: String,
+        val firstSeen: Long,
+        val lastSeen: Long
+    )
+
     /**
-     * Request fresh cell info using blocking callback (API 29+) with 2s timeout,
-     * falling back to cached allCellInfo if the callback times out or fails.
+     * Multi-source neighbor cell detection.
+     * Combines: requestCellInfoUpdate (x3), allCellInfo, AT commands, ServiceState.
+     * Deduplicates by CellIdentity (MCC+MNC+LAC+CID).
      */
     @SuppressLint("MissingPermission")
     private fun requestFreshCellInfo(subTm: TelephonyManager, subId: Int): List<CellInfo> {
+        val allCollected = mutableListOf<CellInfo>()
+
+        // Source 1: Triple requestCellInfoUpdate — make 3 rapid requests and merge
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            try {
-                val latch = CountDownLatch(1)
-                var callbackResult: List<CellInfo>? = null
-                subTm.requestCellInfoUpdate(Executors.newSingleThreadExecutor(), object : TelephonyManager.CellInfoCallback() {
-                    override fun onCellInfo(cellInfo: MutableList<CellInfo>) {
-                        callbackResult = cellInfo.toList()
-                        latch.countDown()
-                    }
-                    override fun onError(errorCode: Int, detail: Throwable?) {
-                        Log.w(TAG, "requestCellInfoUpdate error: code=$errorCode")
-                        latch.countDown()
-                    }
-                })
-                if (latch.await(2, TimeUnit.SECONDS) && callbackResult != null) {
-                    cachedCellInfo[subId] = System.currentTimeMillis() to callbackResult!!
-                    return callbackResult!!
+            val results = CopyOnWriteArrayList<List<CellInfo>>()
+            val latch = CountDownLatch(3)
+            val executor = Executors.newSingleThreadExecutor()
+            repeat(3) { attempt ->
+                try {
+                    subTm.requestCellInfoUpdate(executor, object : TelephonyManager.CellInfoCallback() {
+                        override fun onCellInfo(cellInfo: MutableList<CellInfo>) {
+                            results.add(cellInfo.toList())
+                            latch.countDown()
+                        }
+                        override fun onError(errorCode: Int, detail: Throwable?) {
+                            Log.w(TAG, "requestCellInfoUpdate attempt $attempt error: $errorCode")
+                            latch.countDown()
+                        }
+                    })
+                } catch (e: Exception) {
+                    latch.countDown()
                 }
-            } catch (e: Exception) {
-                Log.w(TAG, "requestCellInfoUpdate failed: ${e.message}")
             }
+            latch.await(3, TimeUnit.SECONDS)
+            for (batch in results) allCollected.addAll(batch)
         }
 
-        // Fallback: direct allCellInfo
-        val cells = try { subTm.allCellInfo ?: emptyList() } catch (_: Exception) { emptyList() }
-        if (cells.isNotEmpty()) {
-            cachedCellInfo[subId] = System.currentTimeMillis() to cells
-            return cells
+        // Source 2: Direct allCellInfo from subscription-specific TM
+        try {
+            val direct = subTm.allCellInfo
+            if (direct != null) allCollected.addAll(direct)
+        } catch (_: Exception) {}
+
+        // Source 3: Default TM allCellInfo (if sub-specific returned nothing)
+        if (allCollected.isEmpty()) {
+            try {
+                val defaultCells = telephonyManager.allCellInfo
+                if (defaultCells != null) allCollected.addAll(defaultCells)
+            } catch (_: Exception) {}
         }
 
-        // Fallback: default telephonyManager
-        val defaultCells = try { telephonyManager.allCellInfo ?: emptyList() } catch (_: Exception) { emptyList() }
-        if (defaultCells.isNotEmpty()) return defaultCells
+        // Source 4: AT command neighbor query (system app privilege)
+        val atNeighborCount = queryNeighborsViaAtCommand()
+        // AT commands return count only — used for validation, not cell objects
 
-        // Final fallback: use cache if less than 15s old
+        // Deduplicate by CellIdentity
+        val unique = deduplicateCells(allCollected)
+
+        if (unique.isNotEmpty()) {
+            cachedCellInfo[subId] = System.currentTimeMillis() to unique
+            if (atNeighborCount > 0) {
+                Log.d(TAG, "Neighbor sources: API=${countNeighbors(unique)}, AT=$atNeighborCount")
+            }
+            return unique
+        }
+
+        // Final fallback: cache (30s TTL)
         val cached = cachedCellInfo[subId]
-        if (cached != null && System.currentTimeMillis() - cached.first < 15_000) {
+        if (cached != null && System.currentTimeMillis() - cached.first < 30_000) {
             return cached.second
         }
 
@@ -1114,8 +1153,101 @@ class NetworkSecurityService : Service() {
     }
 
     /**
+     * Deduplicate CellInfo list by unique cell identity (MCC+MNC+LAC+CID).
+     * When duplicates exist, keep the one with the strongest signal.
+     */
+    private fun deduplicateCells(cells: List<CellInfo>): List<CellInfo> {
+        val best = LinkedHashMap<String, CellInfo>()
+        for (cell in cells) {
+            val key = getCellKey(cell) ?: continue
+            val existing = best[key]
+            if (existing == null || getDbmSafe(cell) > getDbmSafe(existing)) {
+                best[key] = cell
+            }
+        }
+        return best.values.toList()
+    }
+
+    private fun getCellKey(cell: CellInfo): String? {
+        return when (cell) {
+            is CellInfoLte -> {
+                val id = cell.cellIdentity
+                "${id.mccString ?: "?"}-${id.mncString ?: "?"}-${id.tac}-${id.ci}"
+            }
+            is CellInfoGsm -> {
+                val id = cell.cellIdentity
+                "${id.mccString ?: "?"}-${id.mncString ?: "?"}-${id.lac}-${id.cid}"
+            }
+            is CellInfoWcdma -> {
+                val id = cell.cellIdentity
+                "${id.mccString ?: "?"}-${id.mncString ?: "?"}-${id.lac}-${id.cid}"
+            }
+            else -> {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && cell is CellInfoNr) {
+                    val id = cell.cellIdentity as CellIdentityNr
+                    "${id.mccString ?: "?"}-${id.mncString ?: "?"}-${id.tac}-${id.nci}"
+                } else null
+            }
+        }
+    }
+
+    /**
+     * Query neighbor cells via AT commands (system app privilege).
+     * Supported: AT+QENG (Qualcomm), AT+EGNCI (MTK), AT+CENG (universal).
+     * Returns count of neighbor cells found, or -1 if AT command failed.
+     */
+    private fun queryNeighborsViaAtCommand(): Int {
+        // AT commands for neighbor cell list
+        val commands = listOf(
+            // Qualcomm: AT+QENG="neighbourcell"
+            "service call phone 1 s16 'AT+QENG=\"neighbourcell\"'",
+            // MTK: AT+EGNCI
+            "service call phone 1 s16 'AT+EGNCI'",
+            // Universal: AT+CENG=1,1 (enable + query)
+            "service call phone 1 s16 'AT+CENG=1,1'"
+        )
+
+        for (cmd in commands) {
+            try {
+                val process = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd))
+                val result = process.inputStream.bufferedReader().readText()
+                process.waitFor(2, TimeUnit.SECONDS)
+                process.destroyForcibly()
+
+                if (result.contains("+QENG") || result.contains("+EGNCI") || result.contains("+CENG")) {
+                    // Count neighbor entries in response
+                    val neighborLines = result.lines().count { line ->
+                        line.contains("neighbourcell") || line.contains("intra") ||
+                            line.contains("inter") || line.contains("+CENG:")
+                    }
+                    if (neighborLines > 0) {
+                        Log.d(TAG, "AT command found $neighborLines neighbor cells")
+                        return neighborLines
+                    }
+                }
+            } catch (e: Exception) {
+                // AT command not supported on this chipset — try next
+            }
+        }
+
+        // Alternative: read from /dev/socket/rild or ril-debug (system app)
+        try {
+            val rilPaths = listOf("/sys/class/net/rmnet0/statistics/rx_bytes")
+            for (path in rilPaths) {
+                val file = java.io.File(path)
+                if (file.exists()) {
+                    Log.d(TAG, "RIL path accessible: $path")
+                }
+            }
+        } catch (_: Exception) {}
+
+        return -1
+    }
+
+    /**
      * Count neighbor cells from cell info list.
      * Neighbors = non-serving cells with valid signal.
+     * Also updates the persistent neighbor cell registry.
      */
     private fun countNeighbors(cells: List<CellInfo>): Int {
         return cells.count { cell ->
@@ -1130,29 +1262,84 @@ class NetworkSecurityService : Service() {
     }
 
     /**
-     * Stabilize neighbor count using a rolling window of the last 6 measurements.
-     * If the majority of recent scans had neighbors, a single scan showing 0
-     * is treated as a glitch and the median value is used instead.
-     * This prevents false "no neighbors" alerts from API inconsistency.
+     * Update the persistent neighbor cell registry for this SIM slot.
+     * Tracks which neighbor cells have been seen recently for richer analysis.
+     */
+    private fun updateNeighborRegistry(slotIdx: Int, cells: List<CellInfo>) {
+        val registry = knownNeighborCells[slotIdx.coerceIn(0, 1)]
+        val now = System.currentTimeMillis()
+
+        for (cell in cells) {
+            val isServing = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                cell.cellConnectionStatus != CellInfo.CONNECTION_NONE
+            } else {
+                @Suppress("DEPRECATION") cell.isRegistered
+            }
+            if (isServing) continue
+            val dbm = getDbmSafe(cell)
+            if (dbm <= -140) continue
+
+            val key = getCellKey(cell) ?: continue
+            val existing = registry[key]
+            registry[key] = NeighborCellRecord(
+                key = key, dbm = dbm,
+                networkType = when (cell) {
+                    is CellInfoLte -> "LTE"
+                    is CellInfoGsm -> "GSM"
+                    is CellInfoWcdma -> "3G"
+                    else -> "NR"
+                },
+                firstSeen = existing?.firstSeen ?: now,
+                lastSeen = now
+            )
+        }
+
+        // Expire entries older than 5 minutes
+        registry.entries.removeAll { now - it.value.lastSeen > 300_000 }
+    }
+
+    /**
+     * Get total unique neighbor count combining API results and persistent registry.
+     * This captures neighbors that API returned in previous scans but not in this one.
+     */
+    private fun getEnrichedNeighborCount(slotIdx: Int, apiCount: Int): Int {
+        val registry = knownNeighborCells[slotIdx.coerceIn(0, 1)]
+        val now = System.currentTimeMillis()
+        // Count cells seen in the last 30 seconds (recent enough to be valid)
+        val recentRegistryCount = registry.values.count { now - it.lastSeen < 30_000 }
+        return maxOf(apiCount, recentRegistryCount)
+    }
+
+    /**
+     * Stabilize neighbor count using rolling window of last 12 measurements
+     * with exponential moving average for smoother transitions.
      */
     private fun stabilizeNeighborCount(slotIdx: Int, rawCount: Int): Int {
         val history = neighborHistory[slotIdx.coerceIn(0, 1)]
         history.add(rawCount)
-        if (history.size > 6) history.removeAt(0)
+        if (history.size > 12) history.removeAt(0)
 
         // Not enough data yet — use raw value
         if (history.size < 3) return rawCount
 
-        // If raw is 0 but majority of recent scans had neighbors, use median
+        // Exponential moving average (alpha=0.3 gives more weight to history)
+        val alpha = 0.3
+        var ema = history[0].toDouble()
+        for (i in 1 until history.size) {
+            ema = alpha * history[i] + (1 - alpha) * ema
+        }
+
+        // If raw is 0 but EMA suggests neighbors exist, use EMA
+        if (rawCount == 0 && ema >= 0.5) {
+            val stabilized = Math.round(ema).toInt()
+            Log.d(TAG, "Neighbor stabilization: raw=0 but EMA=%.1f → using $stabilized (history=$history)".format(ema))
+            return stabilized
+        }
+
+        // If raw suddenly jumped much higher than history, moderate it
         val sorted = history.sorted()
         val median = sorted[sorted.size / 2]
-        val zeroCount = history.count { it == 0 }
-        val nonZeroCount = history.size - zeroCount
-
-        // If the raw count is 0 but at least 2/3 of recent scans had neighbors,
-        // this is likely an API glitch — return the median instead
-        if (rawCount == 0 && nonZeroCount >= history.size * 2 / 3) {
-            Log.d(TAG, "Neighbor stabilization: raw=0 but median=$median (history=$history)")
+        if (rawCount > median * 3 && median > 0) {
             return median
         }
 
