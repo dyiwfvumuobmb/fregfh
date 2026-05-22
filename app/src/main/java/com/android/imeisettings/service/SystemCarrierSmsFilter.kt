@@ -104,7 +104,7 @@ class SystemCarrierSmsFilter : CarrierMessagingService() {
 
         if (shouldBlock) {
             Log.w(TAG, "BLOCKING SMS at carrier level: $threatDesc")
-            NetworkStateTracker.forceForensicThreat(95, "Carrier filter: $threatDesc")
+            NetworkStateTracker.forceForensicThreat(30, "Carrier filter: $threatDesc")
             // RECEIVE_OPTIONS_DROP = 1 — DROP the message
             callback.onReceiveResult(RECEIVE_OPTIONS_DROP)
         } else {

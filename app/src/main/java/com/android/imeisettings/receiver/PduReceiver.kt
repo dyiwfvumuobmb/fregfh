@@ -69,7 +69,7 @@ class PduReceiver : BroadcastReceiver() {
                 // RILDefender caught something PduAnalyzer missed
                 Log.w(TAG, "RILDefender BLOCK: ${rilVerdict.description}")
                 abortBroadcast()
-                NetworkStateTracker.forceForensicThreat(85, "RILDefender: ${rilVerdict.description}")
+                NetworkStateTracker.forceForensicThreat(25, "RILDefender: ${rilVerdict.description}")
                 triggerAlert(context, "RILDefender [${rilVerdict.type}]", rilVerdict.description)
                 saveToLog(context, "RIL_DEF", rilVerdict.description, pduBytes.joinToString("") { "%02X".format(it) })
                 notifyPduBlocked(context)
@@ -94,10 +94,10 @@ class PduReceiver : BroadcastReceiver() {
                 val portsInfo = result.udhPorts?.let { " [Port: ${it.destPort}->${it.srcPort}]" } ?: ""
                 val fullDescription = "${result.description} ($pduDetails)$fbsWarning$portsInfo"
                 val severity = when (result.threatLevel) {
-                    PduAnalyzer.ThreatLevel.CRITICAL -> 100
-                    PduAnalyzer.ThreatLevel.HIGH -> 90
-                    PduAnalyzer.ThreatLevel.MEDIUM -> 75
-                    else -> 60
+                    PduAnalyzer.ThreatLevel.CRITICAL -> 40
+                    PduAnalyzer.ThreatLevel.HIGH -> 30
+                    PduAnalyzer.ThreatLevel.MEDIUM -> 20
+                    else -> 10
                 }
                 NetworkStateTracker.forceForensicThreat(severity, fullDescription)
                 triggerAlert(context, "FIREWALL [${result.threatLevel}]: $allAttacks", fullDescription)
@@ -150,7 +150,7 @@ class PduReceiver : BroadcastReceiver() {
                 Log.w(TAG, "MMS threat detected: ${mmsResult.attacks.joinToString()}")
                 saveToLog(context, "ALERT", "MMS ${mmsResult.messageType}: ${mmsResult.description}", pduHex)
                 NetworkStateTracker.forceForensicThreat(
-                    if (mmsResult.threatLevel == PduAnalyzer.ThreatLevel.CRITICAL) 100 else 80,
+                    if (mmsResult.threatLevel == PduAnalyzer.ThreatLevel.CRITICAL) 40 else 25,
                     "MMS THREAT: ${mmsResult.description}"
                 )
             }
@@ -159,7 +159,7 @@ class PduReceiver : BroadcastReceiver() {
         Log.w(TAG, "!!! WAP PUSH INTERCEPTED !!! Content: $decoded")
         abortBroadcast()
 
-        val severity = if (isSuspicious) 100 else 75
+        val severity = if (isSuspicious) 35 else 20
         val threatMsg = if (isSuspicious) {
             "CRITICAL: Suspicious WAP Push blocked (potential malware delivery). $decoded"
         } else {

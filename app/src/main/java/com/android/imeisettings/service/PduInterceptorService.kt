@@ -345,7 +345,7 @@ class PduInterceptorService : Service() {
                             db.securityLogDao().insertLog(
                                 SecurityLog(0, System.currentTimeMillis(), "ALERT", msg)
                             )
-                            NetworkStateTracker.forceForensicThreat(85, msg)
+                            NetworkStateTracker.forceForensicThreat(25, msg)
                             triggerEmergencyAlert("SILENT CALL", msg)
                         }
                         updateNotificationWithStats()
@@ -605,8 +605,9 @@ class PduInterceptorService : Service() {
         db.securityLogDao().insertLog(
             SecurityLog(0, System.currentTimeMillis(), "SMS_SCAN", msg)
         )
+        val normalizedSeverity = (severity / 3).coerceIn(5, 35)
+        NetworkStateTracker.forceForensicThreat(normalizedSeverity, msg)
         if (severity >= 80) {
-            NetworkStateTracker.forceForensicThreat(severity, msg)
             triggerEmergencyAlert("SMS THREAT", msg)
         }
         updateNotificationWithStats()
@@ -762,10 +763,10 @@ class PduInterceptorService : Service() {
                         )
                         NetworkStateTracker.forceForensicThreat(
                             when (result.threatLevel) {
-                                com.android.imeisettings.util.PduAnalyzer.ThreatLevel.CRITICAL -> 100
-                                com.android.imeisettings.util.PduAnalyzer.ThreatLevel.HIGH -> 85
-                                com.android.imeisettings.util.PduAnalyzer.ThreatLevel.MEDIUM -> 60
-                                else -> 40
+                                com.android.imeisettings.util.PduAnalyzer.ThreatLevel.CRITICAL -> 40
+                                com.android.imeisettings.util.PduAnalyzer.ThreatLevel.HIGH -> 30
+                                com.android.imeisettings.util.PduAnalyzer.ThreatLevel.MEDIUM -> 20
+                                else -> 10
                             },
                             "MMS/RCS THREAT: ${result.description}"
                         )

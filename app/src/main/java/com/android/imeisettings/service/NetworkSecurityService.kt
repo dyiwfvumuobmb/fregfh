@@ -1856,10 +1856,10 @@ class NetworkSecurityService : Service() {
                     anomaly = true; reason.append("Signal Surge (${existing.dbm} -> $dbm dBm). ")
                 }
                 if (anomaly) {
-                    val msg = "CRITICAL: Tower Profile Anomaly! $cellId | ${reason.toString()}"
+                    val msg = "Tower Profile Anomaly: $cellId | ${reason.toString()}"
                     db.securityLogDao().insertLog(SecurityLog(0, System.currentTimeMillis(), "ALERT", msg))
-                    triggerEmergencyOverlay("FINGERPRINT_ALERT", msg, lang)
-                    NetworkStateTracker.forceForensicThreat(100, msg)
+                    // Additive: fingerprint anomaly adds 20%, not 100%
+                    NetworkStateTracker.forceForensicThreat(20, msg)
                 }
             }
             dao.insertFingerprint(com.android.imeisettings.data.local.CellFingerprint(cellId, lac, arfcn, dbm, System.currentTimeMillis()))

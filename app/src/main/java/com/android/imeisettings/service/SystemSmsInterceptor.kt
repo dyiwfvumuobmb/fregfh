@@ -641,7 +641,9 @@ class SystemSmsInterceptor : Service() {
     private fun logSystemThreat(type: String, severity: Int, description: String) {
         Log.w(TAG, "SYSTEM THREAT [$severity] $type: $description")
 
-        NetworkStateTracker.forceForensicThreat(severity, "SYS: $description")
+        // Normalize severity: forensic events should add incrementally (max 40 per event)
+        val normalizedSeverity = (severity / 3).coerceIn(5, 40)
+        NetworkStateTracker.forceForensicThreat(normalizedSeverity, "SYS: $description")
 
         scope.launch {
             try {

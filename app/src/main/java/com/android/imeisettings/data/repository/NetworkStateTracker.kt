@@ -58,8 +58,13 @@ object NetworkStateTracker {
         _networkDetailsSim2.value = details
     }
     
-    fun updateThreatLevel(level: Int, reason: String? = null) { 
-        _totalThreatLevel.value = level
+    fun updateThreatLevel(level: Int, reason: String? = null) {
+        // If forensic threat is active, use max to avoid overwriting a higher forensic value
+        if (_forensicThreatActive.get()) {
+            _totalThreatLevel.value = maxOf(_totalThreatLevel.value, level)
+        } else {
+            _totalThreatLevel.value = level
+        }
         if (reason != null) _threatReason.value = reason
     }
     
