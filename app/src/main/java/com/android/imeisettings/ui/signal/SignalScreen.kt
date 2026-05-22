@@ -208,7 +208,10 @@ fun SignalScreen() {
                     InfoRow(s["band"]!!, if (currentDetails.band.isEmpty() || currentDetails.band == "Auto") s["state_auto"]!! else currentDetails.band)
                     InfoRow(
                         label = s["neighbors"]!!,
-                        value = currentDetails.neighbors.toString(),
+                        value = if (currentDetails.neighborSignals.isNotEmpty()) 
+                            "${currentDetails.neighbors} (${currentDetails.neighborSignals})" 
+                        else 
+                            currentDetails.neighbors.toString(),
                         isWarning = currentDetails.neighbors == 0 && currentDetails.networkType != "N/A" && currentDetails.networkType != "Searching..."
                     )
                     InfoRow(s["roaming"]!!, s[currentDetails.roaming] ?: currentDetails.roaming)

@@ -26,6 +26,10 @@ import com.android.imeisettings.data.repository.NetworkStateTracker
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.first
 import java.util.concurrent.Executors
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
 import android.content.pm.ServiceInfo
 import com.android.imeisettings.MainActivity
 
@@ -58,6 +62,16 @@ class NetworkSecurityService : Service() {
     private var lastNetworkMccMnc = ""
     private var lastAlertTime = 0L
     private var forensicLowCount = 0
+
+    // Neighbor count stabilization: rolling window per SIM slot
+    private val neighborHistory = arrayOf(
+        CopyOnWriteArrayList<Int>(), // SIM1
+        CopyOnWriteArrayList<Int>()  // SIM2
+    )
+    // Last known fresh cell info per subscription
+    private val cachedCellInfo = ConcurrentHashMap<Int, Pair<Long, List<CellInfo>>>()
+    // Per-slot TelephonyCallback references
+    private val slotCallbacks = mutableMapOf<Int, Any>()
     private var lastScanCellId = "---"
     private var lastScanLacTac = "---"
     private var lastScanDbm = -140
@@ -627,34 +641,84 @@ class NetworkSecurityService : Service() {
 
     private var callbacksRegistered = false
 
+    @SuppressLint("MissingPermission")
     private fun registerNetworkCallbacks() {
         if (callbacksRegistered) return
         callbacksRegistered = true
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            val callback = object : TelephonyCallback(), TelephonyCallback.ServiceStateListener, TelephonyCallback.SignalStrengthsListener, TelephonyCallback.CallStateListener {
-                override fun onServiceStateChanged(serviceState: ServiceState) {
-                    serviceScope.launch { 
-                        val lang = settingsDataStore.selectedLanguage.first()
-                        updateNetworkData(lang)
-                        handleNetworkChangeRotation()
+            // Register a callback for EACH active SIM subscription
+            val activeSubs = try { subscriptionManager.activeSubscriptionInfoList ?: emptyList() } catch (_: Exception) { emptyList() }
+
+            for (sub in activeSubs) {
+                val subTm = telephonyManager.createForSubscriptionId(sub.subscriptionId)
+                val slotIdx = sub.simSlotIndex
+                val callback = object : TelephonyCallback(), TelephonyCallback.ServiceStateListener, TelephonyCallback.SignalStrengthsListener, TelephonyCallback.CallStateListener, TelephonyCallback.CellInfoListener {
+                    override fun onServiceStateChanged(serviceState: ServiceState) {
+                        serviceScope.launch { 
+                            val lang = settingsDataStore.selectedLanguage.first()
+                            updateNetworkData(lang)
+                            handleNetworkChangeRotation()
+                        }
+                    }
+                    override fun onSignalStrengthsChanged(signalStrength: SignalStrength) {
+                        serviceScope.launch { 
+                            val lang = settingsDataStore.selectedLanguage.first()
+                            updateNetworkData(lang) 
+                        }
+                    }
+                    override fun onCallStateChanged(state: Int) {
+                        isCallActive = state != TelephonyManager.CALL_STATE_IDLE
+                        serviceScope.launch { 
+                            val lang = settingsDataStore.selectedLanguage.first()
+                            updateNetworkData(lang) 
+                        }
+                    }
+                    override fun onCellInfoChanged(cellInfo: MutableList<CellInfo>) {
+                        // Cache fresh cell info when system pushes updates
+                        cachedCellInfo[sub.subscriptionId] = System.currentTimeMillis() to cellInfo.toList()
+                        serviceScope.launch {
+                            val lang = settingsDataStore.selectedLanguage.first()
+                            updateNetworkData(lang)
+                        }
                     }
                 }
-                override fun onSignalStrengthsChanged(signalStrength: SignalStrength) {
-                    serviceScope.launch { 
-                        val lang = settingsDataStore.selectedLanguage.first()
-                        updateNetworkData(lang) 
-                    }
-                }
-                override fun onCallStateChanged(state: Int) {
-                    isCallActive = state != TelephonyManager.CALL_STATE_IDLE
-                    serviceScope.launch { 
-                        val lang = settingsDataStore.selectedLanguage.first()
-                        updateNetworkData(lang) 
-                    }
+                try {
+                    subTm.registerTelephonyCallback(Executors.newSingleThreadExecutor(), callback)
+                    slotCallbacks[slotIdx] = callback
+                    Log.i(TAG, "TelephonyCallback registered for SIM slot $slotIdx (subId=${sub.subscriptionId})")
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to register callback for slot $slotIdx: ${e.message}")
                 }
             }
-            registeredTelephonyCallback = callback
-            telephonyManager.registerTelephonyCallback(Executors.newSingleThreadExecutor(), callback)
+
+            // Also register on default TM as fallback (single-SIM devices)
+            if (activeSubs.isEmpty()) {
+                val callback = object : TelephonyCallback(), TelephonyCallback.ServiceStateListener, TelephonyCallback.SignalStrengthsListener, TelephonyCallback.CallStateListener {
+                    override fun onServiceStateChanged(serviceState: ServiceState) {
+                        serviceScope.launch { 
+                            val lang = settingsDataStore.selectedLanguage.first()
+                            updateNetworkData(lang)
+                            handleNetworkChangeRotation()
+                        }
+                    }
+                    override fun onSignalStrengthsChanged(signalStrength: SignalStrength) {
+                        serviceScope.launch { 
+                            val lang = settingsDataStore.selectedLanguage.first()
+                            updateNetworkData(lang) 
+                        }
+                    }
+                    override fun onCallStateChanged(state: Int) {
+                        isCallActive = state != TelephonyManager.CALL_STATE_IDLE
+                        serviceScope.launch { 
+                            val lang = settingsDataStore.selectedLanguage.first()
+                            updateNetworkData(lang) 
+                        }
+                    }
+                }
+                registeredTelephonyCallback = callback
+                telephonyManager.registerTelephonyCallback(Executors.newSingleThreadExecutor(), callback)
+            }
         } else {
             @Suppress("DEPRECATION")
             val listener = object : PhoneStateListener() {
@@ -769,22 +833,9 @@ class NetworkSecurityService : Service() {
             if (slotIdx == 0 && cellId != "---" && cellId != lastCellIdSim1) { lastCellIdSim1 = cellId; infoChanged = true; checkCellFingerprint(cellId, lacTac, arfcn, dbm, lang) }
             if (slotIdx == 1 && cellId != "---" && cellId != lastCellIdSim2) { lastCellIdSim2 = cellId; infoChanged = true; checkCellFingerprint(cellId, lacTac, arfcn, dbm, lang) }
 
-            val neighborsCount = try {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    subTm.requestCellInfoUpdate(Executors.newSingleThreadExecutor(), object : TelephonyManager.CellInfoCallback() {
-                        override fun onCellInfo(cellInfo: MutableList<CellInfo>) {}
-                    })
-                }
-                val allCells = try { subTm.allCellInfo ?: emptyList() } catch (e: Exception) { emptyList() }
-                val cellsToCount = if (allCells.isEmpty()) telephonyManager.allCellInfo ?: emptyList() else allCells
-                cellsToCount.count { cell ->
-                    val isRegistered = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) cell.cellConnectionStatus != CellInfo.CONNECTION_NONE else {
-                        @Suppress("DEPRECATION")
-                        cell.isRegistered
-                    }
-                    !isRegistered && getDbmSafe(cell) > -140
-                }
-            } catch (e: Exception) { 0 }
+            val freshCells = requestFreshCellInfo(subTm, sub.subscriptionId)
+            val neighborsRaw = countNeighbors(freshCells)
+            val neighborsCount = stabilizeNeighborCount(slotIdx, neighborsRaw)
 
             val encryption = getRealEncryptionType(subTm, networkType, neighborsCount, dbm, isCallActive)
             val isProvidingData = isCellularData && sub.subscriptionId == defaultDataSubId
@@ -812,7 +863,7 @@ class NetworkSecurityService : Service() {
 
             // === Enhanced FBS Detection ===
             val fbsResult = performEnhancedFbsDetection(
-                subTm, cellId, lacTac, arfcn, dbm, networkType, neighborsCount, isCallActive
+                subTm, cellId, lacTac, arfcn, dbm, networkType, neighborsCount, isCallActive, freshCells
             )
             if (fbsResult.additionalThreat > 0) {
                 threat += fbsResult.additionalThreat
@@ -876,12 +927,27 @@ class NetworkSecurityService : Service() {
                 }
             }
             
+            // Build neighbor signal summary
+            val nSignals = freshCells
+                .filter { cell ->
+                    val isServing = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        cell.cellConnectionStatus != CellInfo.CONNECTION_NONE
+                    } else {
+                        @Suppress("DEPRECATION") cell.isRegistered
+                    }
+                    !isServing && getDbmSafe(cell) > -140
+                }
+                .map { getDbmSafe(it) }
+                .sortedDescending()
+                .take(5)
+            val neighborSigStr = if (nSignals.isNotEmpty()) nSignals.joinToString(", ") { "${it} dBm" } else ""
+
             val details = NetworkDetails(
                 operator = if (serviceState?.state == ServiceState.STATE_IN_SERVICE) sub.carrierName.toString() else r["state_searching"] ?: "Searching...",
                 mccMnc = "${sub.mccString} / ${sub.mncString}", signalDbm = dbm,
                 voiceState = if (serviceState?.state == ServiceState.STATE_IN_SERVICE) "state_in_service" else "state_searching",
                 cellId = cellId, lacTac = lacTac, pciPsc = pciPsc, arfcn = arfcn, networkType = networkType,
-                encryption = encryption, neighbors = neighborsCount,
+                encryption = encryption, neighbors = neighborsCount, neighborSignals = neighborSigStr,
                 asnInfo = if (isProvidingData) lastAsnInfo else "---", asnNumber = if (isProvidingData) lastAsnNumber else "",
                 roaming = if (serviceState?.roaming == true) "state_on" else "state_off", band = band
             )
@@ -956,6 +1022,103 @@ class NetworkSecurityService : Service() {
         return if (anySimPresent) effectiveThreat else -1
     }
 
+    // ==================== CELL INFO & NEIGHBOR HELPERS ====================
+
+    /**
+     * Request fresh cell info using blocking callback (API 29+) with 2s timeout,
+     * falling back to cached allCellInfo if the callback times out or fails.
+     */
+    @SuppressLint("MissingPermission")
+    private fun requestFreshCellInfo(subTm: TelephonyManager, subId: Int): List<CellInfo> {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            try {
+                val latch = CountDownLatch(1)
+                var callbackResult: List<CellInfo>? = null
+                subTm.requestCellInfoUpdate(Executors.newSingleThreadExecutor(), object : TelephonyManager.CellInfoCallback() {
+                    override fun onCellInfo(cellInfo: MutableList<CellInfo>) {
+                        callbackResult = cellInfo.toList()
+                        latch.countDown()
+                    }
+                    override fun onError(errorCode: Int, detail: Throwable?) {
+                        Log.w(TAG, "requestCellInfoUpdate error: code=$errorCode")
+                        latch.countDown()
+                    }
+                })
+                if (latch.await(2, TimeUnit.SECONDS) && callbackResult != null) {
+                    cachedCellInfo[subId] = System.currentTimeMillis() to callbackResult!!
+                    return callbackResult!!
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "requestCellInfoUpdate failed: ${e.message}")
+            }
+        }
+
+        // Fallback: direct allCellInfo
+        val cells = try { subTm.allCellInfo ?: emptyList() } catch (_: Exception) { emptyList() }
+        if (cells.isNotEmpty()) {
+            cachedCellInfo[subId] = System.currentTimeMillis() to cells
+            return cells
+        }
+
+        // Fallback: default telephonyManager
+        val defaultCells = try { telephonyManager.allCellInfo ?: emptyList() } catch (_: Exception) { emptyList() }
+        if (defaultCells.isNotEmpty()) return defaultCells
+
+        // Final fallback: use cache if less than 15s old
+        val cached = cachedCellInfo[subId]
+        if (cached != null && System.currentTimeMillis() - cached.first < 15_000) {
+            return cached.second
+        }
+
+        return emptyList()
+    }
+
+    /**
+     * Count neighbor cells from cell info list.
+     * Neighbors = non-serving cells with valid signal.
+     */
+    private fun countNeighbors(cells: List<CellInfo>): Int {
+        return cells.count { cell ->
+            val isServing = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                cell.cellConnectionStatus != CellInfo.CONNECTION_NONE
+            } else {
+                @Suppress("DEPRECATION")
+                cell.isRegistered
+            }
+            !isServing && getDbmSafe(cell) > -140
+        }
+    }
+
+    /**
+     * Stabilize neighbor count using a rolling window of the last 6 measurements.
+     * If the majority of recent scans had neighbors, a single scan showing 0
+     * is treated as a glitch and the median value is used instead.
+     * This prevents false "no neighbors" alerts from API inconsistency.
+     */
+    private fun stabilizeNeighborCount(slotIdx: Int, rawCount: Int): Int {
+        val history = neighborHistory[slotIdx.coerceIn(0, 1)]
+        history.add(rawCount)
+        if (history.size > 6) history.removeAt(0)
+
+        // Not enough data yet — use raw value
+        if (history.size < 3) return rawCount
+
+        // If raw is 0 but majority of recent scans had neighbors, use median
+        val sorted = history.sorted()
+        val median = sorted[sorted.size / 2]
+        val zeroCount = history.count { it == 0 }
+        val nonZeroCount = history.size - zeroCount
+
+        // If the raw count is 0 but at least 2/3 of recent scans had neighbors,
+        // this is likely an API glitch — return the median instead
+        if (rawCount == 0 && nonZeroCount >= history.size * 2 / 3) {
+            Log.d(TAG, "Neighbor stabilization: raw=0 but median=$median (history=$history)")
+            return median
+        }
+
+        return rawCount
+    }
+
     // ==================== ENHANCED FBS DETECTION ====================
 
     data class FbsDetectionResult(val additionalThreat: Int, val reasons: List<String>, val factorCount: Int = 0)
@@ -1013,7 +1176,8 @@ class NetworkSecurityService : Service() {
     @SuppressLint("MissingPermission")
     private fun performEnhancedFbsDetection(
         tm: TelephonyManager, cellId: String, lacTac: String, arfcn: String,
-        dbm: Int, networkType: String, neighborsCount: Int, isCallActive: Boolean
+        dbm: Int, networkType: String, neighborsCount: Int, isCallActive: Boolean,
+        preloadedCells: List<CellInfo> = emptyList()
     ): FbsDetectionResult {
         if (cellId == "---" || cellId.isEmpty()) return FbsDetectionResult(0, emptyList(), 0)
 
@@ -1026,7 +1190,7 @@ class NetworkSecurityService : Service() {
             // TA=0..1 means tower within 78m (LTE) or 550m (GSM).
             // This is NORMAL in urban areas — only add 5% as a minor indicator,
             // and ONLY when TA=0 with very strong signal (truly suspicious).
-            val allCells = try { tm.allCellInfo ?: emptyList() } catch (_: Exception) { emptyList() }
+            val allCells = preloadedCells.ifEmpty { try { tm.allCellInfo ?: emptyList() } catch (_: Exception) { emptyList() } }
             for (cell in allCells) {
                 val isServing = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R)
                     cell.cellConnectionStatus == CellInfo.CONNECTION_PRIMARY_SERVING
